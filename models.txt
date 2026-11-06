@@ -1,6 +1,2 @@
 llama3.2:1b
 qwen2.5:3b
-llama3.2:3b
-phi3.5:latest
-gemma2:2b
-deepseek-r1:1.5b
