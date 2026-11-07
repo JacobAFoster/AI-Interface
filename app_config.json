@@ -1,0 +1,6 @@
+{
+  "model": "llama3.2:1b",
+  "persona": "(None \u2014 default assistant)",
+  "allow_auto_pull": true,
+  "window_geometry": "1280x840+130+130"
+}

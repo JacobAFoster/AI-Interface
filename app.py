@@ -1,869 +1,975 @@
+"""Entry point: LocalAIApp holds state and wires the UI panels together."""
 import os
 import json
-import sqlite3
-import subprocess
+import time
 import threading
+import subprocess
 import urllib.request
 import urllib.error
-from datetime import datetime, timedelta
-from contextlib import contextmanager
-from flask import Flask, request, Response, jsonify, session, render_template_string
+import tkinter as tk
+from tkinter import ttk, messagebox, simpledialog, filedialog
 
-app = Flask(__name__)
-app.secret_key = os.environ.get("FLASK_SECRET", os.urandom(24).hex())
+from core.db import (
+    _migrate_cwd_files, _init_db, _save_app_config, _db,
+    _load_app_config,
+    _get_conversations, _get_messages, _create_conversation,
+    _add_message, _delete_message, _delete_conversation, _rename_conversation,
+    _trim_orphans_in_db,
+    _add_task, _delete_task,
+    NO_PERSONA, PERSONALITIES_FILE, MODELS_FILE,
+    DEFAULT_REMINDER_MINUTES,
+)
+from core.parsing import (
+    _parse_ts_relaxed,
+    _extract_calendar_events, _extract_task_blocks,
+)
+from core.context import _calendar_context, _code_output_rules
+from core.reminders import (
+    ReminderService, _load_notifier_config, _save_notifier_config, _send_ntfy,
+)
+from ui.sidebar import Sidebar
+from ui.chat import ChatPanel
+from ui.calendar import CalendarTab
+from ui.tasks import TaskTab
 
-OLLAMA_HOST = os.environ.get("OLLAMA_HOST", "http://127.0.0.1:11434")
-MAX_HISTORY = 20
-APP_PASSWORD = os.environ.get("APP_PASSWORD", "")
 
-# --- Personalities --------------------------------------------------------
-def _load_personalities():
-    path = "personalities.txt"
-    defaults = {
-        "Seasoned Tech Lead": "You are an elite veteran software engineer and technical lead. Focus on architectural best practices, clean code, performance, scalability, security, and robust error handling.",
-        "Startup Founder": "You are a pragmatic, growth-driven startup founder and serial entrepreneur. Focus on MVPs, monetization strategies, rapid execution, and market validation.",
-        "Deep Research Analyst": "You are an elite research scientist and investigative analyst. Focus on uncovering comprehensive facts, synthesizing complex information from multiple angles, examining historical and technical context, maintaining strict objectivity, and structuring findings into clear, exhaustive reports with rigorous detail."
-    }
-    try:
-        if not os.path.exists(path):
-            with open(path, "w", encoding="utf-8") as f:
-                for n, p in defaults.items():
-                    f.write(f"{n} = {p}\n")
-        result = {}
-        with open(path, "r", encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if line and not line.startswith("#") and "=" in line:
-                    k, v = line.split("=", 1)
-                    result[k.strip()] = v.strip()
-        return result or defaults
-    except Exception as e:
-        print(f"Personalities load error: {e}")
-        return defaults
+class LocalAIApp:
+    MAX_HISTORY_MESSAGES = 20
+    OLLAMA_CHAT_URL = "http://localhost:11434/api/chat"
 
-PERSONALITIES = _load_personalities()
+    def __init__(self, root):
+        _migrate_cwd_files()
+        _init_db()
 
-# --- Session-scoped conversation memory -----------------------------------
-_sessions = {}
-_sessions_lock = threading.Lock()
+        self.root = root
+        self.root.title("Local AI Dev & Business Hub")
 
-def _get_history():
-    if "sid" not in session:
-        session["sid"] = os.urandom(16).hex()
-    with _sessions_lock:
-        return _sessions.setdefault(session["sid"], [])
-
-def _save_history(h):
-    sid = session.get("sid")
-    with _sessions_lock:
-        _sessions[sid] = h[-MAX_HISTORY:]
-
-# --- Calendar DB (NEW) ----------------------------------------------------
-CALENDAR_DB = os.environ.get("CALENDAR_DB", "calendar.db")
-
-def _init_calendar_db():
-    with sqlite3.connect(CALENDAR_DB) as conn:
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS events (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                title TEXT NOT NULL,
-                start_ts TEXT NOT NULL,
-                end_ts TEXT NOT NULL,
-                description TEXT DEFAULT '',
-                created_at TEXT DEFAULT CURRENT_TIMESTAMP
-            )
-        """)
-        conn.commit()
-
-_init_calendar_db()
-
-@contextmanager
-def _db():
-    conn = sqlite3.connect(CALENDAR_DB)
-    conn.row_factory = sqlite3.Row
-    try:
-        yield conn
-        conn.commit()
-    except Exception:
-        conn.rollback()
-        raise
-    finally:
-        conn.close()
-
-def _normalize_ts(s):
-    """Normalize to YYYY-MM-DDTHH:MM so lexicographic range queries work."""
-    if not s:
-        return None
-    s = s.strip()
-    for fmt in ("%Y-%m-%dT%H:%M", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%d %H:%M"):
+        saved_geo = None
         try:
-            return datetime.strptime(s, fmt).strftime("%Y-%m-%dT%H:%M")
-        except ValueError:
-            continue
-    return s
+            saved_geo = _load_app_config().get("window_geometry")
+        except Exception:
+            pass
+        self.root.geometry(saved_geo if saved_geo else "1280x840")
 
-def _calendar_context():
-    """Injected into every chat system prompt so the AI knows 'now' and upcoming events."""
-    now = datetime.now()
-    horizon = now + timedelta(days=14)
-    with _db() as conn:
-        rows = conn.execute(
-            "SELECT * FROM events WHERE end_ts >= ? AND start_ts <= ? ORDER BY start_ts LIMIT 50",
-            (now.strftime("%Y-%m-%dT%H:%M"), horizon.strftime("%Y-%m-%dT%H:%M"))
-        ).fetchall()
-    if rows:
-        lines = [f"- {r['start_ts']} -> {r['end_ts']}: {r['title']}" +
-                 (f" ({r['description']})" if r['description'] else "") for r in rows]
-    else:
-        lines = ["(no upcoming events)"]
-    return (
-        f"\n\n[Calendar context]\n"
-        f"Current local time: {now.strftime('%Y-%m-%dT%H:%M')} "
-        f"({now.strftime('%A, %B %d, %Y')})\n"
-        f"Upcoming events (next 14 days):\n" + "\n".join(lines) + "\n\n"
-        "When the user asks you to schedule, propose, or reschedule events, include a "
-        "fenced code block tagged 'calendar' containing a single JSON object with keys "
-        "title, start_ts, end_ts, description. Use LOCAL time in format YYYY-MM-DDTHH:MM. "
-        "Example:\n"
-        "```calendar\n"
-        '{"title": "Team sync", "start_ts": "2025-01-15T14:00", '
-        '"end_ts": "2025-01-15T14:30", "description": "Weekly sync"}\n'
-        "```\n"
-        "You may emit multiple calendar blocks if the user wants several events. "
-        "Always confirm the details in prose too."
-    )
+        style = ttk.Style()
+        style.theme_use("clam")
 
-# --- Auth -----------------------------------------------------------------
-def _require_auth():
-    if not APP_PASSWORD:
+        # ---- State ----
+        self.personalities = {}
+        self.load_personalities_file()
+
+        self.notifier_config = _load_notifier_config()
+        self.app_config = _load_app_config()
+
+        self._notifier_save_id = None
+        self.current_model = tk.StringVar(value="")
+        self.current_persona = tk.StringVar(value=NO_PERSONA)
+        self.is_streaming = False
+        self.conversation_history = []
+        self.current_conversation_id = None
+
+        self._stream_cancel = threading.Event()
+        self._current_response = None
+
+        # ---- Layout ----
+        self.root.columnconfigure(1, weight=1)
+        self.root.rowconfigure(0, weight=1)
+
+        self.sidebar = Sidebar(self.root, self)
+        self.sidebar.grid(row=0, column=0, sticky="nsew")
+
+        self.notebook = ttk.Notebook(self.root)
+        self.notebook.grid(row=0, column=1, sticky="nsew")
+
+        self.chat_panel = ChatPanel(self.notebook, self)
+        self.notebook.add(self.chat_panel, text="💬 Chat")
+
+        self.calendar_tab = CalendarTab(self.notebook, self)
+        self.notebook.add(self.calendar_tab, text="📅 Calendar")
+
+        self.tasks_tab = TaskTab(self.notebook, self)
+        self.notebook.add(self.tasks_tab, text="📋 Tasks")
+
+        self.notebook.bind("<<NotebookTabChanged>>", self._on_tab_changed)
+
+        # ---- Background service ----
+        self.reminder_service = ReminderService(self)
+        self.reminder_service.start()
+
+        # ---- Global bindings ----
+        self.root.protocol("WM_DELETE_WINDOW", self._on_close)
+        self.root.bind("<Control-n>", lambda e: self._new_conversation())
+        self.root.bind("<Control-l>", lambda e: self.chat_panel._clear_terminal_display())
+        self.root.bind("<Control-f>", lambda e: self._focus_filter())
+        self.root.bind("<Escape>", self._handle_escape)
+
+        # ---- Initial conversation ----
+        self.sidebar.refresh_conversations()
+        first = self.sidebar.select_first()
+        if first is not None:
+            self._load_conversation(first)
+
+        self.load_and_sync_models()
+
+        if self.notifier_config.get("enabled") and self.notifier_config.get("ntfy_topic"):
+            self.root.after(1500, lambda: self.flash_status(
+                f"🔔 Reminders active on topic '{self.notifier_config['ntfy_topic']}'",
+                "green", 4000))
+
+    # --- Status delegation ------------------------------------------------
+    def flash_status(self, message, color="green", duration=2500):
+        self.chat_panel.flash_status(message, color, duration)
+
+    def start_timer(self):
+        self.chat_panel.start_timer()
+
+    def stop_timer(self):
+        self.chat_panel.stop_timer()
+
+    # --- Personalities ----------------------------------------------------
+    def load_personalities_file(self):
+        fallback = {
+            "Seasoned Tech Lead": "You are an elite veteran software engineer and technical lead.",
+            "Startup Founder": "You are a pragmatic, growth-driven startup founder.",
+            "Deep Research Analyst": "You are an elite research scientist and investigative analyst."
+        }
+        try:
+            if os.path.exists(PERSONALITIES_FILE):
+                with open(PERSONALITIES_FILE, "r", encoding="utf-8") as f:
+                    for line in f:
+                        line = line.strip()
+                        if line and not line.startswith("#") and "=" in line:
+                            k, v = line.split("=", 1)
+                            self.personalities[k.strip()] = v.strip()
+            
+            # If the file exists but is empty, or doesn't exist, use fallback
+            if not self.personalities:
+                self.personalities = fallback
+        except Exception as e:
+            print(f"Error loading personalities: {e}")
+            self.personalities = fallback
+
+    def reload_personalities(self):
+        self.personalities = {}
+        self.load_personalities_file()
+        self.sidebar.refresh_personas()
+        self.app_config["persona"] = NO_PERSONA
+        _save_app_config(self.app_config)
+        self.flash_status("Status: Personalities reloaded", "green")
+
+    # --- Conversations ----------------------------------------------------
+    def _load_conversation(self, cid):
+        _trim_orphans_in_db(cid)
+        self.current_conversation_id = cid
+        messages = _get_messages(cid)
+        self.conversation_history = messages[-self._max_history():]
+        self.chat_panel.clear_terminal()
+        for m in messages:
+            self.chat_panel.render_message(m["role"], m["content"])
+        self._update_history_label()
+
+        if self.conversation_history and self.conversation_history[-1]["role"] in ("user", "assistant"):
+            self.chat_panel.retry_button.config(state="normal")
+        else:
+            self.chat_panel.retry_button.config(state="disabled")
+
+        self.flash_status(
+            f"Status: Loaded conversation ({len(messages)} messages)", "green")
+
+    def _new_conversation(self):
+        if self.is_streaming:
+            self.flash_status("Status: Wait for current response to finish", "orange")
+            return
+        self.current_conversation_id = None
+        self.conversation_history = []
+        self.chat_panel.clear_terminal()
+        self.sidebar.conversation_listbox.selection_clear(0, tk.END)
+        self._update_history_label()
+        self.chat_panel.retry_button.config(state="disabled")
+        self.flash_status("Status: New conversation started", "green")
+
+    def _delete_current_conversation(self):
+        if self.is_streaming:
+            self.flash_status("Status: Wait for current response to finish", "orange")
+            return
+        if self.current_conversation_id is None:
+            self.flash_status("Status: No conversation to delete", "orange")
+            return
+        self._delete_conversation_by_id(self.current_conversation_id)
+
+    def _delete_conversation_by_id(self, cid):
+        if not messagebox.askyesno(
+                "Delete Conversation",
+                "Delete this conversation? This cannot be undone."):
+            return
+        _delete_conversation(cid)
+        if self.current_conversation_id == cid:
+            self.current_conversation_id = None
+            self.conversation_history = []
+            self.chat_panel.clear_terminal()
+        self.sidebar.refresh_conversations()
+        if self.current_conversation_id is None:
+            first = self.sidebar.select_first()
+            if first is not None:
+                self._load_conversation(first)
+        else:
+            self._update_history_label()
+        self.flash_status("Status: Conversation deleted", "green")
+
+    def _rename_conversation_dialog(self, cid):
+        current = next((c["title"] for c in _get_conversations() if c["id"] == cid), "")
+        new_title = simpledialog.askstring(
+            "Rename Conversation", "New title:",
+            initialvalue=current, parent=self.root)
+        if not new_title:
+            return
+        new_title = new_title.strip()
+        if not new_title or new_title == current:
+            return
+        try:
+            _rename_conversation(cid, new_title)
+            self.sidebar.refresh_conversations()
+            self.flash_status("Status: Conversation renamed", "green")
+        except Exception as e:
+            self.flash_status(f"Error: {e}", "red")
+
+    def _export_conversation(self, cid):
+        try:
+            title = next((c["title"] for c in _get_conversations() if c["id"] == cid),
+                         "conversation")
+            safe_title = "".join(
+                [c for c in title if c.isalnum() or c in " -_"]).strip()
+            filepath = filedialog.asksaveasfilename(
+                parent=self.root,
+                defaultextension=".md",
+                filetypes=[("Markdown", "*.md"), ("All Files", "*.*")],
+                initialfile=f"{safe_title}.md"
+            )
+            if not filepath:
+                return
+            msgs = _get_messages(cid)
+            md_lines = [f"# {title}\n"]
+            for m in msgs:
+                role = "User" if m["role"] == "user" else "AI"
+                md_lines.append(f"### {role}\n\n{m['content']}\n\n")
+            with open(filepath, "w", encoding="utf-8") as f:
+                f.write("\n".join(md_lines))
+            self.flash_status("Exported to Markdown", "green")
+        except Exception as e:
+            messagebox.showerror("Export Error", f"Failed to export: {e}",
+                                 parent=self.root)
+
+    # --- History / context labels ----------------------------------------
+    def _max_history(self):
+        try:
+            return int(self.app_config.get("max_history_messages",
+                                           self.MAX_HISTORY_MESSAGES))
+        except (TypeError, ValueError):
+            return self.MAX_HISTORY_MESSAGES
+
+    def _update_history_label(self):
+        self.sidebar.update_history_label(len(self.conversation_history))
+        self._update_ctx_label()
+
+    def _update_ctx_label(self):
+        total_chars = sum(len(m.get("content", "")) for m in self.conversation_history)
+        approx = total_chars // 4
+        try:
+            limit = int(self.app_config.get("num_ctx", 4096))
+        except (TypeError, ValueError):
+            limit = 4096
+        if approx > limit * 0.85:
+            color = "#c586c0"
+        elif approx > limit * 0.6:
+            color = "orange"
+        else:
+            color = "#666"
+        self.sidebar.update_ctx_label(approx, limit, color)
+
+    # --- Keyboard / misc --------------------------------------------------
+    def _focus_filter(self):
+        self.sidebar.focus_filter()
+
+    def _handle_escape(self, event=None):
+        if self.is_streaming:
+            self._cancel_stream()
         return None
-    a = request.authorization
-    if not a or a.password != APP_PASSWORD:
-        return Response("Authentication required", 401,
-                        {"WWW-Authenticate": 'Basic realm="Local AI"'})
-    return None
 
-# --- Routes ---------------------------------------------------------------
-@app.route("/")
-def index():
-    denied = _require_auth()
-    if denied: return denied
-    return render_template_string(HTML_TEMPLATE, personalities=list(PERSONALITIES.keys()))
+    def _on_tab_changed(self, event=None):
+        try:
+            idx = self.notebook.index(self.notebook.select())
+            if idx == 1:
+                self.calendar_tab.refresh()
+            elif idx == 2:
+                self.tasks_tab.refresh()
+        except Exception:
+            pass
 
-@app.route("/api/models")
-def list_models():
-    denied = _require_auth()
-    if denied: return denied
-    try:
-        r = subprocess.run(["ollama", "list"], capture_output=True, text=True, check=True)
-        lines = r.stdout.strip().split("\n")[1:]
-        models = [ln.split()[0] for ln in lines if ln.strip()]
-        return jsonify({"models": models})
-    except Exception as e:
-        return jsonify({"models": [], "error": str(e)}), 500
+    def _on_close(self):
+        try:
+            self.app_config["window_geometry"] = self.root.winfo_geometry()
+            _save_app_config(self.app_config)
+        except Exception as e:
+            print(f"Save geometry error: {e}")
+        try:
+            self.reminder_service.stop()
+        except Exception:
+            pass
+        try:
+            self._stream_cancel.set()
+        except Exception:
+            pass
+        self.root.after(150, self.root.destroy)
 
-@app.route("/api/sync", methods=["POST"])
-def sync_models():
-    denied = _require_auth()
-    if denied: return denied
-    try:
-        mf = "models.txt"
-        if not os.path.exists(mf):
-            with open(mf, "w", encoding="utf-8") as f:
-                f.write("llama3.2:1b\nqwen2.5:1.5b\n")
-        with open(mf, "r", encoding="utf-8") as f:
-            desired = [l.strip() for l in f if l.strip() and not l.startswith("#")]
-        if not desired:
-            desired = ["llama3.2:1b"]
-        r = subprocess.run(["ollama", "list"], capture_output=True, text=True, check=True)
-        installed = [l.split()[0] for l in r.stdout.strip().split("\n")[1:] if l.strip()]
-        new_ones = []
-        for m in desired:
-            if m not in installed:
+    # --- Settings / notifier ----------------------------------------------
+    def _open_settings_dialog(self):
+        dlg = tk.Toplevel(self.root)
+        dlg.title("Settings")
+        dlg.transient(self.root)
+        dlg.grab_set()
+        dlg.resizable(False, False)
+        pad = {"padx": 10, "pady": 4}
+
+        row1 = ttk.Frame(dlg); row1.pack(fill="x", **pad)
+        ttk.Label(row1, text="num_ctx:", width=18).pack(side=tk.LEFT)
+        num_ctx_var = tk.StringVar(value=str(self.app_config.get("num_ctx", 16384)))
+        ttk.Entry(row1, textvariable=num_ctx_var, width=14).pack(side=tk.LEFT)
+        ttk.Label(row1, text="  (context window, tokens)",
+                  foreground="gray").pack(side=tk.LEFT)
+
+        row2 = ttk.Frame(dlg); row2.pack(fill="x", **pad)
+        ttk.Label(row2, text="Max history:", width=18).pack(side=tk.LEFT)
+        max_hist_var = tk.StringVar(
+            value=str(self.app_config.get("max_history_messages", 20)))
+        ttk.Entry(row2, textvariable=max_hist_var, width=14).pack(side=tk.LEFT)
+        ttk.Label(row2, text="  (messages sent to model)",
+                  foreground="gray").pack(side=tk.LEFT)
+
+        row3 = ttk.Frame(dlg); row3.pack(fill="x", **pad)
+        ttk.Label(row3, text="Temperature:", width=18).pack(side=tk.LEFT)
+        temp_var = tk.StringVar(value=str(self.app_config.get("temperature", 0.2)))
+        ttk.Entry(row3, textvariable=temp_var, width=14).pack(side=tk.LEFT)
+        ttk.Label(row3, text="  (0.0 – 2.0)", foreground="gray").pack(side=tk.LEFT)
+
+        row4 = ttk.Frame(dlg); row4.pack(fill="x", **pad)
+        ttk.Label(row4, text="top_p:", width=18).pack(side=tk.LEFT)
+        top_p_var = tk.StringVar(value=str(self.app_config.get("top_p", 0.9)))
+        ttk.Entry(row4, textvariable=top_p_var, width=14).pack(side=tk.LEFT)
+        ttk.Label(row4, text="  (0.0 – 1.0)", foreground="gray").pack(side=tk.LEFT)
+
+        def _save():
+            try:
+                nc = int(num_ctx_var.get().strip())
+                if nc < 512 or nc > 131072:
+                    raise ValueError("num_ctx must be 512 – 131072")
+                mh = int(max_hist_var.get().strip())
+                if mh < 2 or mh > 200:
+                    raise ValueError("Max history must be 2 – 200")
+                tp = float(temp_var.get().strip())
+                if tp < 0.0 or tp > 2.0:
+                    raise ValueError("Temperature must be 0.0 – 2.0")
+                tpv = float(top_p_var.get().strip())
+                if tpv < 0.0 or tpv > 1.0:
+                    raise ValueError("top_p must be 0.0 – 1.0")
+            except ValueError as e:
+                messagebox.showerror("Settings", str(e), parent=dlg)
+                return
+            self.app_config["num_ctx"] = nc
+            self.app_config["max_history_messages"] = mh
+            self.app_config["temperature"] = tp
+            self.app_config["top_p"] = tpv
+            _save_app_config(self.app_config)
+            self._update_ctx_label()
+            self.flash_status("Status: Settings saved", "green")
+            dlg.destroy()
+
+        btn_row = ttk.Frame(dlg); btn_row.pack(fill="x", padx=10, pady=(10, 10))
+        ttk.Button(btn_row, text="Cancel", command=dlg.destroy).pack(side=tk.RIGHT)
+        ttk.Button(btn_row, text="Save", command=_save).pack(side=tk.RIGHT, padx=(0, 6))
+
+    def _preview_system_prompt(self):
+        persona_key = self.current_persona.get()
+        sp = "" if persona_key == NO_PERSONA else self.personalities.get(persona_key, "")
+        sp += _calendar_context()
+        pending = ""
+        if not self.chat_panel.has_placeholder:
+            pending = self.chat_panel.user_input_field.get("1.0", tk.END).strip()
+        if pending:
+            rules = _code_output_rules(pending)
+            if rules:
+                sp += rules
+        body = sp if sp.strip() else "(empty — no persona and no upcoming events)"
+        self.chat_panel.append_to_terminal("System Prompt Preview", body)
+
+    def _on_notifier_config_changed(self):
+        self.notifier_config["ntfy_topic"] = self.sidebar.ntfy_topic_var.get().strip()
+        self.notifier_config["enabled"] = bool(self.sidebar.reminder_enabled_var.get())
+
+        lead_str = self.sidebar.lead_minutes_var.get().strip()
+        parsed = []
+        for tok in lead_str.replace(",", " ").split():
+            if not tok:
+                continue
+            try:
+                v = int(tok)
+                if 0 < v <= 1440:
+                    parsed.append(v)
+            except ValueError:
+                pass
+        if parsed:
+            self.notifier_config["lead_minutes"] = sorted(set(parsed))
+
+        self.reminder_service.reset_notified()
+
+        if self._notifier_save_id is not None:
+            try:
+                self.root.after_cancel(self._notifier_save_id)
+            except Exception:
+                pass
+        self._notifier_save_id = self.root.after(400, self._save_notifier_config_debounced)
+
+    def _save_notifier_config_debounced(self):
+        self._notifier_save_id = None
+        _save_notifier_config(self.notifier_config)
+
+    def _test_notification(self):
+        topic = self.sidebar.ntfy_topic_var.get().strip()
+        if not topic:
+            messagebox.showwarning("ntfy", "Enter a topic name first.")
+            return
+        ok = _send_ntfy(topic, "🔔 Test reminder",
+                        "If you see this on your phone, reminders work.")
+        if ok:
+            self.flash_status("🔔 Test notification sent — check your phone",
+                              "green", 4000)
+        else:
+            self.flash_status("⚠️ Test failed — check topic name and network",
+                              "#c33", 5000)
+
+    def _show_ntfy_help(self):
+        leads = self.notifier_config.get("lead_minutes", [15, 60])
+        leads_str = ", ".join(f"{x} min" for x in leads)
+        messagebox.showinfo(
+            "Set up phone reminders with ntfy",
+            "1. Install the free ntfy app on your phone (Android: Play Store, iOS: App Store).\n\n"
+            "2. In the app, tap + and subscribe to a topic name — use something long and unique, "
+            "e.g. 'alex-calendar-7f3a91c4'. The topic name acts as a password, so don't use 'calendar'.\n\n"
+            "3. Type the same topic name in the box here and tick 'Enable reminders'.\n\n"
+            "4. Each event and task has its own reminder time (default 30 min before). "
+            "Set it in the event/task dialog, or ask the AI to include reminder_minutes.\n\n"
+            f"Legacy events without an explicit reminder fall back to these global lead times: "
+            f"{leads_str} before the event.\n\n"
+            "5. Click Test. You should get a push notification on your phone within a couple of seconds.\n\n"
+            "Self-hosted ntfy? Set the NTFY_URL environment variable (e.g. https://ntfy.example.com/)."
+        )
+
+    # --- Models -----------------------------------------------------------
+    def _enable_send(self):
+        self.chat_panel.set_send_enabled(True)
+
+    def _disable_send_no_ollama(self):
+        self.chat_panel.set_send_enabled(False)
+
+    def load_and_sync_models(self):
+        if "allow_auto_pull" not in self.app_config:
+            allow = messagebox.askyesno(
+                "Auto-download Ollama models",
+                "This app can download missing Ollama models automatically.\n\n"
+                "First-time downloads can be several gigabytes.\n\n"
+                "Allow auto-download?\n\n"
+                "(You can change this later in app_config.json.)")
+            self.app_config["allow_auto_pull"] = bool(allow)
+            _save_app_config(self.app_config)
+        allow_pull = bool(self.app_config.get("allow_auto_pull", False))
+
+        self.sidebar.set_loading_message("Checking models...")
+        self.chat_panel.start_spinner("Syncing models")
+
+        def background_sync():
+            try:
+                if not os.path.exists(MODELS_FILE):
+                    with open(MODELS_FILE, "w", encoding="utf-8") as f:
+                        f.write("llama3.2:1b\nqwen2.5:1.5b\n")
+                with open(MODELS_FILE, "r", encoding="utf-8") as f:
+                    desired = [l.strip() for l in f if l.strip() and not l.startswith("#")]
+                if not desired:
+                    desired = ["llama3.2:1b"]
+
+                installed = []
+                metadata = {}
                 try:
-                    subprocess.run(["ollama", "pull", m], check=True, capture_output=True)
-                    new_ones.append(m)
+                    r = subprocess.run(["ollama", "list"],
+                                       capture_output=True, text=True, check=True)
+                    lines = r.stdout.strip().split("\n")
+                    if len(lines) > 1:
+                        for line in lines[1:]:
+                            if not line.strip():
+                                continue
+                            parts = line.split()
+                            if len(parts) >= 5:
+                                m_name = parts[0]
+                                size = parts[3] + " " + parts[4]
+                                installed.append(m_name)
+                                try:
+                                    r_show = subprocess.run(
+                                        ["ollama", "show", m_name],
+                                        capture_output=True, text=True, check=True)
+                                    params = "?"
+                                    for sl in r_show.stdout.split('\n'):
+                                        if "parameters" in sl.lower():
+                                            p_parts = sl.split()
+                                            if len(p_parts) >= 2:
+                                                params = p_parts[-1]
+                                                break
+                                    metadata[m_name] = f"Params: {params} | Size: {size}"
+                                except Exception:
+                                    metadata[m_name] = f"Size: {size}"
+                except FileNotFoundError:
+                    self.root.after(0, self.chat_panel.stop_spinner)
+                    self.root.after(0, lambda: self.sidebar.set_models(
+                        ["(Ollama not installed)"]))
+                    self.root.after(0, self._disable_send_no_ollama)
+                    self.root.after(0, lambda: self.chat_panel.set_status(
+                        "Status: Ollama missing — chat disabled", "red"))
+                    self.root.after(0, lambda: messagebox.showerror(
+                        "Ollama not found",
+                        "Install Ollama from https://ollama.com, then restart this app.\n\n"
+                        "After installing, click '🔄 Sync & Reload Models'."))
+                    return
                 except Exception:
                     pass
-        return jsonify({"models": desired, "newly_installed": new_ones})
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
 
-@app.route("/api/history")
-def get_history_route():
-    denied = _require_auth()
-    if denied: return denied
-    return jsonify({"messages": _get_history()})
+                for m in desired:
+                    if m not in installed and allow_pull:
+                        self.root.after(0, lambda mm=m: self.chat_panel.set_spinner_message(
+                            f"Installing {mm}"))
+                        try:
+                            subprocess.run(["ollama", "pull", m],
+                                           check=True, capture_output=True)
+                        except Exception as e:
+                            print(f"Failed to auto-install {m}: {e}")
 
-@app.route("/api/clear", methods=["POST"])
-def clear_history():
-    denied = _require_auth()
-    if denied: return denied
-    _save_history([])
-    return jsonify({"ok": True})
+                self.root.after(0, self.chat_panel.stop_spinner)
+                self.root.after(0, lambda: self.sidebar.set_models(desired, metadata))
+                self.root.after(0, lambda: self.chat_panel.set_status("Status: Idle", "gray"))
+                self.root.after(0, self._enable_send)
+            except Exception as e:
+                self.root.after(0, self.chat_panel.stop_spinner)
+                self.root.after(0, lambda err=e: self.sidebar.set_models(
+                    [f"Error: {err}"]))
+                self.root.after(0, lambda: self.chat_panel.set_status(
+                    "Status: Sync Error", "red"))
 
-# --- Calendar API (NEW) ---------------------------------------------------
-@app.route("/api/events")
-def list_events():
-    denied = _require_auth()
-    if denied: return denied
-    start = request.args.get("start")
-    end = request.args.get("end")
-    with _db() as conn:
-        if start and end:
-            rows = conn.execute(
-                "SELECT * FROM events WHERE start_ts < ? AND end_ts > ? ORDER BY start_ts",
-                (end, start)
-            ).fetchall()
-        else:
-            rows = conn.execute("SELECT * FROM events ORDER BY start_ts").fetchall()
-    return jsonify({"events": [dict(r) for r in rows]})
+        threading.Thread(target=background_sync, daemon=True).start()
 
-@app.route("/api/events", methods=["POST"])
-def create_event():
-    denied = _require_auth()
-    if denied: return denied
-    data = request.get_json() or {}
-    title = (data.get("title") or "").strip()
-    start = _normalize_ts(data.get("start_ts"))
-    end = _normalize_ts(data.get("end_ts"))
-    if not title or not start or not end:
-        return jsonify({"error": "title, start_ts, end_ts required"}), 400
-    with _db() as conn:
-        cur = conn.execute(
-            "INSERT INTO events (title, start_ts, end_ts, description) VALUES (?, ?, ?, ?)",
-            (title, start, end, (data.get("description") or "").strip())
-        )
-        ev = dict(conn.execute("SELECT * FROM events WHERE id=?", (cur.lastrowid,)).fetchone())
-    return jsonify({"event": ev}), 201
-
-@app.route("/api/events/<int:eid>", methods=["PUT"])
-def update_event(eid):
-    denied = _require_auth()
-    if denied: return denied
-    data = request.get_json() or {}
-    with _db() as conn:
-        row = conn.execute("SELECT * FROM events WHERE id=?", (eid,)).fetchone()
-        if not row:
-            return jsonify({"error": "not found"}), 404
-        conn.execute(
-            "UPDATE events SET title=?, start_ts=?, end_ts=?, description=? WHERE id=?",
-            (data.get("title", row["title"]),
-             _normalize_ts(data.get("start_ts", row["start_ts"])),
-             _normalize_ts(data.get("end_ts", row["end_ts"])),
-             data.get("description", row["description"]),
-             eid)
-        )
-        ev = dict(conn.execute("SELECT * FROM events WHERE id=?", (eid,)).fetchone())
-    return jsonify({"event": ev})
-
-@app.route("/api/events/<int:eid>", methods=["DELETE"])
-def delete_event(eid):
-    denied = _require_auth()
-    if denied: return denied
-    with _db() as conn:
-        conn.execute("DELETE FROM events WHERE id=?", (eid,))
-    return jsonify({"ok": True})
-
-# --- Chat -----------------------------------------------------------------
-@app.route("/api/chat", methods=["POST"])
-def chat():
-    denied = _require_auth()
-    if denied: return denied
-
-    data = request.get_json() or {}
-    model = data.get("model")
-    persona = data.get("persona")
-    message = (data.get("message") or "").strip()
-    deep = bool(data.get("deep_research"))
-
-    if not model or not message:
-        return jsonify({"error": "Missing model or message"}), 400
-
-    system_prompt = PERSONALITIES.get(persona, "")
-    system_prompt += _calendar_context()  # NEW: give the AI a clock + calendar
-
-    if deep:
-        message = (
-            f"Perform an in-depth, comprehensive research report on the following topic: '{message}'.\n\n"
-            "Provide a structured breakdown including:\n"
-            "1. Executive Summary & Overview\n2. Key Concepts & Core Principles\n"
-            "3. Practical Applications & Use Cases\n4. Potential Challenges & Future Outlook\n\n"
-            "Write thoroughly and in detail."
-        )
-
-    history = _get_history()
-    messages = []
-    if system_prompt:
-        messages.append({"role": "system", "content": system_prompt})
-    messages.extend(history[-MAX_HISTORY:])
-    messages.append({"role": "user", "content": message})
-
-    def generate():
-        payload = json.dumps({"model": model, "messages": messages, "stream": True}).encode()
-        req = urllib.request.Request(
-            OLLAMA_HOST + "/api/chat",
-            data=payload,
-            headers={"Content-Type": "application/json"},
-        )
-        acc = []
+    # --- Ollama helpers ---------------------------------------------------
+    def _start_ollama(self):
         try:
-            with urllib.request.urlopen(req, timeout=600) as resp:
-                for raw in resp:
-                    if not raw.strip():
+            subprocess.Popen(["ollama", "serve"],
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            self.flash_status("Ollama server starting...", "orange")
+            self.root.after(3000, self._check_ollama_started)
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to start Ollama: {e}")
+
+    def _check_ollama_started(self):
+        try:
+            urllib.request.urlopen("http://localhost:11434/", timeout=1)
+            self.flash_status("Ollama is running!", "green")
+            self._enable_send()
+        except Exception:
+            self.root.after(2000, self._check_ollama_started)
+
+    # --- Send / stream ----------------------------------------------------
+    def _regenerate_response(self):
+        if self.is_streaming or not self.conversation_history:
+            return
+        if self.current_conversation_id is None:
+            return
+
+        if self.conversation_history[-1]["role"] == "assistant":
+            last_user = ""
+            for m in reversed(self.conversation_history):
+                if m["role"] == "user":
+                    last_user = m["content"]
+                    break
+            if not last_user:
+                return
+
+            with _db() as conn:
+                rows = conn.execute(
+                    "SELECT id FROM messages WHERE conversation_id = ? ORDER BY id DESC LIMIT 2",
+                    (self.current_conversation_id,)
+                ).fetchall()
+                for r in rows:
+                    conn.execute("DELETE FROM messages WHERE id = ?", (r["id"],))
+
+            while self.conversation_history:
+                if self.conversation_history[-1]["role"] == "user":
+                    self.conversation_history.pop()
+                    break
+                self.conversation_history.pop()
+
+        elif self.conversation_history[-1]["role"] == "user":
+            last_user = self.conversation_history[-1]["content"]
+            with _db() as conn:
+                rows = conn.execute(
+                    "SELECT id FROM messages WHERE conversation_id = ? ORDER BY id DESC LIMIT 1",
+                    (self.current_conversation_id,)
+                ).fetchall()
+                for r in rows:
+                    conn.execute("DELETE FROM messages WHERE id = ?", (r["id"],))
+            self.conversation_history.pop()
+        else:
+            return
+
+        self.chat_panel.clear_terminal()
+        for m in self.conversation_history:
+            self.chat_panel.render_message(m["role"], m["content"])
+
+        self._send_message(last_user)
+
+    def send_query(self):
+        if self.chat_panel.has_placeholder:
+            return
+        q = self.chat_panel.user_input_field.get("1.0", tk.END).strip()
+        if not q:
+            self.flash_status("Status: Nothing to send", "orange", 1500)
+            return
+        if not self.current_model.get():
+            self.flash_status("Status: Select a model first", "orange")
+            return
+        if self.is_streaming:
+            self.flash_status("Status: Wait for current response", "orange")
+            return
+        self.chat_panel._reset_input_field()
+        self._send_message(q)
+
+
+    def _send_message(self, query, display_text=None, sender="You"):
+        if self.is_streaming:
+            self.flash_status("Status: Wait for current response", "orange")
+            return
+        model = self.current_model.get()
+        persona_key = self.current_persona.get()
+        if not query or not model:
+            return
+
+        if self.current_conversation_id is None:
+            seed = (display_text if display_text is not None else query).split("\n")[0].strip() or "New conversation"
+            if len(seed) > 50:
+                seed = seed[:50] + "…"
+            self.current_conversation_id = _create_conversation(seed)
+            self.sidebar.refresh_conversations()
+
+        user_msg_id = None
+        try:
+            user_msg_id = _add_message(self.current_conversation_id, "user", query)
+            self.sidebar.refresh_conversations()
+        except Exception as e:
+            print(f"DB save user msg error: {e}")
+
+        self.chat_panel.append_to_terminal(
+            sender, display_text if display_text is not None else query)
+        self.chat_panel.start_timer()
+
+        system_prompt = "" if persona_key == NO_PERSONA else self.personalities.get(persona_key, "")
+        system_prompt += _calendar_context()
+        system_prompt += _code_output_rules(query)
+
+        messages = []
+        if system_prompt:
+            messages.append({"role": "system", "content": system_prompt})
+        max_hist = self._max_history()
+        messages.extend(self.conversation_history[-max_hist:])
+        messages.append({"role": "user", "content": query})
+
+        self._stream_cancel.clear()
+        self.is_streaming = True
+        self.chat_panel.stop_button.config(state="normal")
+        self.chat_panel.send_button.config(state="disabled")
+        self.chat_panel.retry_button.config(state="disabled")
+        try:
+            self.chat_panel.user_input_field.focus_set()
+        except Exception:
+            pass
+        threading.Thread(target=self._run_chat_stream,
+                         args=(model, messages, persona_key, query, user_msg_id),
+                         daemon=True).start()
+
+    def _cancel_stream(self):
+        if not self.is_streaming:
+            return
+        self._stream_cancel.set()
+        self.chat_panel.stop_button.config(state="disabled")
+        self.chat_panel.set_status("⏹ Stopping…", "orange")
+        resp = self._current_response
+        if resp is not None:
+            try:
+                resp.close()
+            except Exception:
+                pass
+
+    def _rollback_user_message(self, msg_id):
+        if msg_id is None:
+            return
+        try:
+            _delete_message(msg_id)
+        except Exception as e:
+            print(f"Rollback user message error: {e}")
+
+    def _run_chat_stream(self, model, messages, persona_key, user_message, user_msg_id):
+        try:
+            temperature = float(self.app_config.get("temperature", 0.2))
+        except (TypeError, ValueError):
+            temperature = 0.2
+        try:
+            top_p = float(self.app_config.get("top_p", 0.9))
+        except (TypeError, ValueError):
+            top_p = 0.9
+        try:
+            num_ctx = int(self.app_config.get("num_ctx", 4096))
+        except (TypeError, ValueError):
+            num_ctx = 4096
+        max_hist = self._max_history()
+
+        payload = json.dumps({
+            "model": model,
+            "messages": messages,
+            "stream": True,
+            "options": {
+                "temperature": temperature,
+                "top_p": top_p,
+                "repeat_penalty": 1.05,
+                "num_ctx": num_ctx,
+            }
+        }).encode("utf-8")
+        req = urllib.request.Request(self.OLLAMA_CHAT_URL, data=payload,
+                                     headers={"Content-Type": "application/json"})
+        accumulated = []
+        header_shown = False
+        saved_assistant = False
+        cancelled = False
+
+        try:
+            with urllib.request.urlopen(req, timeout=600) as response:
+                self._current_response = response
+                for raw_line in response:
+                    if self._stream_cancel.is_set():
+                        cancelled = True
+                        break
+                    if not raw_line.strip():
                         continue
                     try:
-                        chunk = json.loads(raw)
+                        chunk = json.loads(raw_line.decode("utf-8"))
                     except json.JSONDecodeError:
                         continue
-                    content = (chunk.get("message") or {}).get("content", "")
-                    if content:
-                        acc.append(content)
-                        yield f"data: {json.dumps({'content': content})}\n\n"
-                    if chunk.get("done"):
+                    if not header_shown:
+                        self.root.after(0, self.chat_panel.stop_timer)
+                        persona_label = "no persona" if persona_key == NO_PERSONA else persona_key
+                        self.root.after(0, lambda lbl=f"AI ({model} | {persona_label})":
+                                        self.chat_panel.append_ai_header(lbl))
+                        header_shown = True
+                        self.root.after(0, lambda: self.chat_panel.set_status(
+                            "⏳ Streaming…", "orange"))
+                    if "message" in chunk:
+                        content = chunk["message"].get("content", "")
+                        if content:
+                            accumulated.append(content)
+                            self.root.after(
+                                0, lambda c=content: self.chat_panel.stream_chunk_to_terminal(c))
+                    if chunk.get("done", False):
                         break
-            full = "".join(acc).strip()
-            if full:
-                history.append({"role": "user", "content": message})
-                history.append({"role": "assistant", "content": full})
-                _save_history(history)
-            yield f"data: {json.dumps({'done': True, 'memory': len(_get_history())})}\n\n"
+
+            if cancelled:
+                self._rollback_user_message(user_msg_id)
+                return
+
+            full_response = "".join(accumulated).strip()
+
+            if not full_response:
+                placeholder = "(The model returned an empty response.)"
+                self.root.after(0, lambda: self.chat_panel.stream_chunk_to_terminal(
+                    f"{placeholder}\n\n"))
+                try:
+                    _add_message(self.current_conversation_id, "assistant", placeholder)
+                    saved_assistant = True
+                except Exception as e:
+                    print(f"DB save empty response error: {e}")
+                self.conversation_history.append({"role": "user", "content": user_message})
+                self.conversation_history.append({"role": "assistant", "content": placeholder})
+                if len(self.conversation_history) > max_hist:
+                    self.conversation_history = self.conversation_history[-max_hist:]
+                self.root.after(0, lambda: self.flash_status(
+                    "⚠️ Model returned an empty response", "#c33", 4000))
+                self.root.after(0, self._update_history_label)
+                self.root.after(0, self.sidebar.refresh_conversations)
+                return
+
+            self.root.after(0, lambda: self.chat_panel.stream_chunk_to_terminal("\n\n"))
+            self.conversation_history.append({"role": "user", "content": user_message})
+            self.conversation_history.append({"role": "assistant", "content": full_response})
+            if len(self.conversation_history) > max_hist:
+                self.conversation_history = self.conversation_history[-max_hist:]
+            try:
+                _add_message(self.current_conversation_id, "assistant", full_response)
+                saved_assistant = True
+            except Exception as e:
+                print(f"DB save assistant msg error: {e}")
+            self.root.after(0, self._update_history_label)
+            self.root.after(0, self.sidebar.refresh_conversations)
+            self.root.after(0, lambda: self.chat_panel._replace_last_ai_message(full_response))
+
         except urllib.error.URLError as e:
-            yield f"data: {json.dumps({'error': f'Cannot reach Ollama: {e}'})}\n\n"
+            if self._stream_cancel.is_set():
+                cancelled = True
+                self._rollback_user_message(user_msg_id)
+            else:
+                self._rollback_user_message(user_msg_id)
+                self.root.after(0, self.chat_panel.stop_timer)
+                self.root.after(0, lambda msg=str(e): self.chat_panel.append_error(
+                    f"⚠️ Cannot connect to Ollama ({msg}). Is `ollama serve` running?"))
+                self.root.after(0, self.chat_panel.inject_ollama_start_btn)
         except Exception as e:
-            yield f"data: {json.dumps({'error': str(e)})}\n\n"
+            if self._stream_cancel.is_set():
+                cancelled = True
+                self._rollback_user_message(user_msg_id)
+            else:
+                self._rollback_user_message(user_msg_id)
+                self.root.after(0, self.chat_panel.stop_timer)
+                self.root.after(0, lambda msg=str(e): self.chat_panel.append_error(
+                    f"⚠️ Error: {msg}"))
+        finally:
+            self._current_response = None
+            self.root.after(0, lambda ok=saved_assistant, c=cancelled:
+                            self._on_stream_finished(ok, c))
 
-    return Response(
-        generate(),
-        mimetype="text/event-stream",
-        headers={"X-Accel-Buffering": "no", "Cache-Control": "no-cache"},
-    )
+    def _on_stream_finished(self, had_assistant_reply=False, cancelled=False):
+        self.is_streaming = False
+        self.chat_panel.stop_button.config(state="disabled")
+        self.chat_panel.send_button.config(state="normal")
+        self.chat_panel.stop_timer()
 
-# --- HTML template --------------------------------------------------------
-HTML_TEMPLATE = r"""<!DOCTYPE html>
-<html><head><meta charset="utf-8"><title>Local AI Hub</title>
-<style>
-*{box-sizing:border-box}
-body{margin:0;font-family:'Segoe UI',sans-serif;background:#1e1e1e;color:#d4d4d4;height:100vh;overflow:hidden}
-#app{display:flex;height:100vh}
-#sidebar{width:290px;background:#252526;padding:12px;display:flex;flex-direction:column;gap:8px;overflow-y:auto;border-right:1px solid #333}
-#main{flex:1;display:flex;flex-direction:column;padding:12px;min-width:0}
-h1{font-size:16px;margin:0 0 4px}
-h2{font-size:12px;margin:6px 0 2px;color:#bbb;text-transform:uppercase;letter-spacing:.5px}
-button{background:#0e639c;color:#fff;border:none;padding:7px 10px;cursor:pointer;border-radius:3px;font-size:13px;font-family:inherit}
-button:hover:not(:disabled){background:#1177bb}
-button:disabled{background:#444;cursor:not-allowed}
-button.danger{background:#a12a2a}
-button.danger:hover:not(:disabled){background:#c33}
-.listbox{background:#1e1e1e;color:#d4d4d4;border:1px solid #3c3c3c;border-radius:3px;height:160px;overflow-y:auto;font-family:Consolas,monospace;font-size:12px}
-.listbox .item{padding:5px 8px;cursor:pointer}
-.listbox .item:hover{background:#2a2d2e}
-.listbox .item.selected{background:#094771}
-#status{font-size:12px;color:#888;font-style:italic;margin:4px 0 6px}
-#chat{flex:1;overflow-y:auto;background:#1e1e1e;border:1px solid #333;border-radius:3px;padding:10px;font-family:Consolas,monospace;font-size:13px;word-wrap:break-word;user-select:text}
-.msg-header{margin-top:12px;font-weight:bold;font-family:'Segoe UI',sans-serif}
-.msg-header.user{color:#4ec9b0}
-.msg-header.ai{color:#c586c0}
-.msg-body{margin:4px 0 0 10px;white-space:pre-wrap}
-.msg-body.user{background:#252526;padding:6px 10px;border-radius:3px}
-.msg-body.error{color:#f48771}
-#input-row{display:flex;gap:8px;margin-top:8px}
-#input{flex:1;background:#1e1e1e;color:#d4d4d4;border:1px solid #3c3c3c;border-radius:3px;padding:8px;font-family:Consolas,monospace;font-size:13px;resize:vertical;min-height:72px}
-#buttons{display:flex;flex-direction:column;gap:6px}
-#buttons button{width:145px}
-#memory{font-size:11px;color:#888;font-style:italic;margin-top:4px}
+        if had_assistant_reply or (
+                self.conversation_history
+                and self.conversation_history[-1]["role"] == "user"):
+            self.chat_panel.retry_button.config(state="normal")
+        else:
+            self.chat_panel.retry_button.config(state="disabled")
 
-/* --- Tabs --- */
-#tabs{display:flex;margin-bottom:8px;border-bottom:1px solid #333}
-.tab-btn{background:transparent;color:#888;padding:10px 16px;border-bottom:2px solid transparent;border-radius:0;font-size:13px}
-.tab-btn:hover{color:#d4d4d4;background:transparent}
-.tab-btn.active{color:#fff;border-bottom-color:#0e639c}
-.tab-content{display:none;flex-direction:column;flex:1;min-height:0}
-.tab-content.active{display:flex}
+        try:
+            self.chat_panel.user_input_field.focus_set()
+        except Exception:
+            pass
 
-/* --- Calendar --- */
-#cal-wrap{display:flex;gap:12px;flex:1;min-height:0}
-#cal-main{flex:1;display:flex;flex-direction:column;min-width:0}
-#cal-toolbar{display:flex;gap:8px;align-items:center;margin-bottom:8px}
-#cal-title{font-size:16px;font-weight:bold;flex:1}
-#cal-grid{display:grid;grid-template-columns:repeat(7,1fr);grid-auto-rows:1fr;gap:1px;background:#333;border:1px solid #333;border-radius:3px;flex:1;min-height:320px;overflow:hidden}
-.cal-header-cell{background:#252526;padding:6px;text-align:center;font-size:11px;color:#888;text-transform:uppercase;letter-spacing:.5px}
-.cal-cell{background:#1e1e1e;padding:4px 5px;font-size:11px;cursor:pointer;overflow:hidden;display:flex;flex-direction:column;gap:2px;min-height:0}
-.cal-cell:hover{background:#2a2d2e}
-.cal-cell.cal-other-month{color:#555}
-.cal-cell.cal-today .cal-day-num{background:#0e639c;color:#fff;border-radius:50%}
-.cal-cell.cal-selected{background:#094771}
-.cal-day-num{font-size:11px;width:20px;height:20px;display:flex;align-items:center;justify-content:center}
-.cal-event-pill{background:#0e639c;color:#fff;font-size:10px;padding:1px 4px;border-radius:2px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-.cal-event-more{font-size:9px;color:#888}
-#cal-side{width:280px;display:flex;flex-direction:column;gap:8px;min-height:0}
-#cal-selected-date{font-size:13px;font-weight:bold;color:#4ec9b0}
-#cal-event-list{flex:1;overflow-y:auto;background:#252526;border-radius:3px;padding:8px;font-size:12px}
-.cal-empty{color:#666;font-style:italic}
-.cal-event-row{border-left:3px solid #0e639c;padding:6px 8px;margin-bottom:6px;background:#1e1e1e;border-radius:2px}
-.cal-event-time{font-size:10px;color:#888}
-.cal-event-title{font-weight:bold;margin:2px 0}
-.cal-event-desc{color:#aaa;font-size:11px;margin:2px 0;white-space:pre-wrap}
-.cal-event-actions{display:flex;gap:4px;margin-top:4px}
-.mini-btn{padding:2px 6px;font-size:10px;background:#333}
-.mini-btn:hover{background:#444}
-.mini-btn.danger{background:#a12a2a}
-.mini-btn.danger:hover{background:#c33}
+        if cancelled:
+            self.flash_status("Status: Stopped", "orange", 2000)
+            return
 
-/* --- Modal --- */
-#event-modal{position:fixed;inset:0;background:rgba(0,0,0,0.6);display:none;align-items:center;justify-content:center;z-index:100}
-#event-modal.open{display:flex}
-.modal-box{background:#252526;padding:20px;border-radius:4px;width:420px;max-width:92vw;display:flex;flex-direction:column;gap:10px}
-.modal-box h3{margin:0 0 4px;font-size:14px}
-.modal-box label{font-size:11px;color:#888;display:block;margin-bottom:3px;text-transform:uppercase}
-.modal-box input,.modal-box textarea{width:100%;background:#1e1e1e;color:#d4d4d4;border:1px solid #3c3c3c;border-radius:3px;padding:6px;font-family:inherit;font-size:12px}
-.modal-box textarea{resize:vertical;min-height:60px}
-.modal-actions{display:flex;gap:8px;justify-content:flex-end;margin-top:8px}
+        if not had_assistant_reply:
+            return
 
-/* --- AI calendar suggestion card --- */
-.cal-suggestion{background:#252526;border:1px solid #0e639c;border-radius:3px;padding:8px 10px;margin:8px 0;font-size:12px}
-.cal-suggestion .suggestion-title{color:#4ec9b0;font-weight:bold;margin-bottom:2px}
-</style></head><body>
-<div id="app">
-  <div id="sidebar">
-    <h2>🤖 Models</h2>
-    <div class="listbox" id="model-list"></div>
-    <button onclick="syncModels()">🔄 Sync &amp; Reload Models</button>
-    <h2>💼 Professional Role</h2>
-    <div class="listbox" id="persona-list"></div>
-    <h2>⚙️ Session</h2>
-    <button class="danger" onclick="clearConversation()">🗑️ Clear Conversation</button>
-    <div id="memory">Memory: 0 messages</div>
-  </div>
-  <div id="main">
-    <div id="tabs">
-      <button class="tab-btn active" data-tab="chat" onclick="showTab('chat')">💬 Chat</button>
-      <button class="tab-btn" data-tab="calendar" onclick="showTab('calendar')">📅 Calendar</button>
-    </div>
+        proposed = self._offer_calendar_suggestions()
+        if proposed:
+            self.flash_status(
+                f"📅📋 {proposed} item{'s' if proposed > 1 else ''} proposed — "
+                f"review the cards below",
+                "orange", duration=8000)
+            return
 
-    <!-- Chat tab -->
-    <div id="tab-chat" class="tab-content active">
-      <h1>💻 Dev &amp; Business Terminal</h1>
-      <div id="status">Status: Idle</div>
-      <div id="chat"></div>
-      <div id="input-row">
-        <textarea id="input" placeholder="Type your prompt here... (Ctrl+Enter to send)"></textarea>
-        <div id="buttons">
-          <button id="send-btn" onclick="sendMessage(false)">Execute 🚀</button>
-          <button id="research-btn" onclick="sendMessage(true)">Deep Research 🔍</button>
-        </div>
-      </div>
-    </div>
+        last = self.conversation_history[-1].get("content", "") if self.conversation_history else ""
+        looks_like_event = (
+            '"title"' in last or "'title'" in last or
+            '"start"' in last or '"start_ts"' in last or
+            '"due_ts"' in last or
+            "```calendar" in last.lower() or
+            "```task" in last.lower()
+        )
+        if looks_like_event:
+            self.flash_status(
+                "⚠️ Model tried to create an item but format didn't parse "
+                "(check parse_failures.log)",
+                "#c33", duration=6000)
+            return
 
-    <!-- Calendar tab -->
-    <div id="tab-calendar" class="tab-content">
-      <div id="cal-wrap">
-        <div id="cal-main">
-          <div id="cal-toolbar">
-            <button onclick="calPrev()">◀</button>
-            <div id="cal-title"></div>
-            <button onclick="calNext()">▶</button>
-            <button onclick="calToday()">Today</button>
-            <button onclick="openNewEvent()">+ New Event</button>
-          </div>
-          <div id="cal-grid"></div>
-        </div>
-        <div id="cal-side">
-          <div id="cal-selected-date"></div>
-          <div id="cal-event-list"></div>
-        </div>
-      </div>
-    </div>
-  </div>
-</div>
+        if len(self.conversation_history) >= 2:
+            last_user = self.conversation_history[-2].get("content", "").lower()
+            keywords = ("schedule", "book", "add to calendar", "remind",
+                        "meeting", "appointment", "reserve",
+                        "task", "to-do", "todo", "add to task")
+            if any(k in last_user for k in keywords):
+                self.flash_status(
+                    "⚠️ No calendar/task proposal in AI reply "
+                    "(model didn't attempt to schedule anything)",
+                    "#c33", duration=4000)
+        self.chat_panel._check_scroll_btn()
 
-<!-- Event modal -->
-<div id="event-modal">
-  <div class="modal-box">
-    <h3 id="event-modal-title">New Event</h3>
-    <input type="hidden" id="event-id" />
-    <div><label>Title</label><input id="event-title" /></div>
-    <div><label>Start</label><input type="datetime-local" id="event-start" /></div>
-    <div><label>End</label><input type="datetime-local" id="event-end" /></div>
-    <div><label>Description</label><textarea id="event-description"></textarea></div>
-    <div class="modal-actions">
-      <button onclick="closeEventModal()" style="background:#444">Cancel</button>
-      <button onclick="saveEvent()">Save</button>
-    </div>
-  </div>
-</div>
+    def _offer_calendar_suggestions(self):
+        if not self.conversation_history:
+            return 0
+        last = self.conversation_history[-1]
+        if last.get("role") != "assistant":
+            return 0
+        content = last.get("content", "")
+        events = _extract_calendar_events(content)
+        tasks = _extract_task_blocks(content)
+        if events:
+            self.chat_panel.render_calendar_suggestions(events)
+        if tasks:
+            self.chat_panel.render_task_suggestions(tasks)
+        return len(events) + len(tasks)
 
-<script>
-const PERSONALITIES = {{ personalities|tojson }};
-let selectedModel = null;
-let selectedPersona = PERSONALITIES[0] || null;
-let busy = false;
-const $ = id => document.getElementById(id);
+    def _add_suggested_event(self, ev):
+        try:
+            rm = ev.get("reminder_minutes")
+            if rm is None:
+                rm = DEFAULT_REMINDER_MINUTES
+            with _db() as conn:
+                conn.execute(
+                    "INSERT INTO events (title, start_ts, end_ts, description, "
+                    "reminder_minutes) VALUES (?, ?, ?, ?, ?)",
+                    (ev["title"],
+                     _parse_ts_relaxed(ev["start_ts"]) or ev["start_ts"],
+                     _parse_ts_relaxed(ev["end_ts"]) or ev["end_ts"],
+                     ev.get("description", ""), int(rm)))
+            self.calendar_tab.refresh()
+            self.flash_status(f"Status: Added '{ev['title']}' to calendar", "green")
+            rm_note = f", 🔔 {int(rm)}m before" if int(rm) > 0 else ", 🔕 off"
+            note = (f"[System note: Event confirmed and saved — "
+                    f"'{ev['title']}' at {ev['start_ts']} to {ev['end_ts']}{rm_note}]")
+            self.conversation_history.append({"role": "assistant", "content": note})
+            try:
+                _add_message(self.current_conversation_id, "assistant", note)
+            except Exception as e:
+                print(f"DB save system note error: {e}")
+        except Exception as e:
+            self.flash_status(f"Status: Failed to add event: {e}", "red")
 
-function escapeHtml(s) {
-  return String(s == null ? '' : s).replace(/[&<>"']/g, c => (
-    {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]
-  ));
-}
+    def _add_suggested_task(self, t):
+        try:
+            rm = t.get("reminder_minutes")
+            if rm is None:
+                rm = DEFAULT_REMINDER_MINUTES
+            _add_task(t["title"], t.get("description", ""),
+                      t.get("due_ts"), t.get("priority", "normal"), int(rm))
+            self.tasks_tab.refresh()
+            self.flash_status(f"Status: Added task '{t['title']}'", "green")
+            rm_note = f", 🔔 {int(rm)}m before" if int(rm) > 0 else ", 🔕 off"
+            note = (f"[System note: Task confirmed and saved — "
+                    f"'{t['title']}'"
+                    + (f" (due: {t['due_ts']})" if t.get('due_ts') else "")
+                    + rm_note + "]")
+            self.conversation_history.append(
+                {"role": "assistant", "content": note})
+            try:
+                _add_message(self.current_conversation_id, "assistant", note)
+            except Exception as e:
+                print(f"DB save system note error: {e}")
+        except Exception as e:
+            self.flash_status(f"Status: Failed to add task: {e}", "red")
 
-// --- Tabs ---
-function showTab(name) {
-  document.querySelectorAll('.tab-content').forEach(el => el.classList.remove('active'));
-  document.querySelectorAll('.tab-btn').forEach(el => el.classList.remove('active'));
-  document.getElementById('tab-' + name).classList.add('active');
-  document.querySelector('.tab-btn[data-tab="' + name + '"]').classList.add('active');
-  if (name === 'calendar') loadEvents();
-}
-
-// --- Chat (unchanged core) ---
-function renderList(container, items, onSelect) {
-  container.innerHTML = '';
-  items.forEach(item => {
-    const div = document.createElement('div');
-    div.className = 'item';
-    div.textContent = item;
-    div.onclick = () => {
-      container.querySelectorAll('.item').forEach(x => x.classList.remove('selected'));
-      div.classList.add('selected');
-      onSelect(item);
-    };
-    container.appendChild(div);
-  });
-}
-function selectFirst(container) {
-  const f = container.querySelector('.item');
-  if (f) f.classList.add('selected');
-  return f ? f.textContent : null;
-}
-function setStatus(text, color) { const s = $('status'); s.textContent = text; s.style.color = color || '#888'; }
-function appendUser(text) {
-  const chat = $('chat');
-  const h = document.createElement('div'); h.className = 'msg-header user'; h.textContent = '[You]';
-  const b = document.createElement('div'); b.className = 'msg-body user'; b.textContent = text;
-  chat.append(h, b); chat.scrollTop = chat.scrollHeight;
-}
-let currentAiText = '';
-function startAiBlock(label) {
-  const chat = $('chat');
-  const h = document.createElement('div'); h.className = 'msg-header ai'; h.textContent = '[' + (label || 'AI') + ']';
-  const b = document.createElement('div'); b.className = 'msg-body ai'; b.id = 'current-ai';
-  chat.append(h, b); chat.scrollTop = chat.scrollHeight;
-  currentAiText = '';
-}
-function appendAiChunk(text) {
-  const b = $('current-ai'); if (!b) return;
-  b.textContent += text; currentAiText += text;
-  $('chat').scrollTop = $('chat').scrollHeight;
-}
-function appendError(text) {
-  const chat = $('chat');
-  const b = document.createElement('div'); b.className = 'msg-body error'; b.textContent = '⚠️ ' + text;
-  chat.appendChild(b); chat.scrollTop = chat.scrollHeight;
-}
-function updateMemory(n) { $('memory').textContent = 'Memory: ' + n + ' messages'; }
-
-async function loadModels() {
-  try {
-    const r = await fetch('/api/models'); const d = await r.json();
-    if (d.error) return setStatus('Error: ' + d.error, 'red');
-    if (!d.models.length) { $('model-list').innerHTML = '<div class="item">No models installed</div>'; return; }
-    renderList($('model-list'), d.models, m => { selectedModel = m; });
-    selectedModel = selectFirst($('model-list'));
-  } catch (e) { setStatus('Cannot reach server', 'red'); }
-}
-async function syncModels() {
-  setStatus('Syncing models (may take a while)...', 'orange');
-  $('model-list').innerHTML = '<div class="item">Checking...</div>';
-  try {
-    const r = await fetch('/api/sync', {method: 'POST'}); const d = await r.json();
-    if (d.error) return setStatus('Sync error: ' + d.error, 'red');
-    await loadModels();
-    setStatus('Sync complete' + (d.newly_installed?.length ? ' (' + d.newly_installed.length + ' new)' : ''), 'green');
-  } catch (e) { setStatus('Sync failed', 'red'); }
-}
-async function clearConversation() {
-  if (!confirm('Clear conversation and terminal display?')) return;
-  await fetch('/api/clear', {method: 'POST'});
-  $('chat').innerHTML = '';
-  updateMemory(0);
-  setStatus('Conversation cleared', 'green');
-}
-async function sendMessage(deep) {
-  if (busy) return;
-  const text = $('input').value.trim();
-  if (!text) return;
-  if (!selectedModel) return setStatus('No model selected', 'red');
-  $('input').value = '';
-  appendUser((deep ? '🔍 ' : '') + text);
-  startAiBlock('AI (' + selectedModel + ' | ' + selectedPersona + ')');
-  busy = true; $('send-btn').disabled = true; $('research-btn').disabled = true;
-  const t0 = Date.now();
-  const timer = setInterval(() => {
-    setStatus('🧠 Thinking... (' + Math.floor((Date.now()-t0)/1000) + 's)', 'orange');
-  }, 500);
-  try {
-    const resp = await fetch('/api/chat', {
-      method: 'POST',
-      headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({model: selectedModel, persona: selectedPersona, message: text, deep_research: deep})
-    });
-    if (!resp.ok) { appendError('Server error: ' + resp.status); return; }
-    const reader = resp.body.getReader(); const dec = new TextDecoder();
-    let buf = '';
-    while (true) {
-      const {done, value} = await reader.read();
-      if (done) break;
-      buf += dec.decode(value, {stream: true});
-      const lines = buf.split('\n'); buf = lines.pop() || '';
-      for (const line of lines) {
-        if (!line.startsWith('data: ')) continue;
-        let p; try { p = JSON.parse(line.slice(6)); } catch { continue; }
-        if (p.content) { clearInterval(timer); setStatus('Receiving...', 'green'); appendAiChunk(p.content); }
-        if (p.error) appendError(p.error);
-        if (p.done) updateMemory(p.memory);
-      }
-    }
-  } catch (e) { appendError(e.message); }
-  finally {
-    clearInterval(timer);
-    setStatus('Status: Idle', '#888');
-    busy = false; $('send-btn').disabled = false; $('research-btn').disabled = false;
-    const ai = $('current-ai');
-    if (ai) {
-      ai.id = '';
-      // Replace raw ```calendar blocks with a friendly marker
-      if (/```calendar/.test(currentAiText)) {
-        ai.textContent = currentAiText.replace(/```calendar\s*\n[\s\S]*?```/g, '\n📅 [Event proposed below]\n');
-      }
-      parseCalendarSuggestions(currentAiText);
-    }
-  }
-}
-
-// --- AI calendar block parsing ---
-function parseCalendarSuggestions(text) {
-  const re = /```calendar\s*\n([\s\S]*?)```/g;
-  let match;
-  while ((match = re.exec(text)) !== null) {
-    try {
-      const ev = JSON.parse(match[1].trim());
-      if (ev.title && ev.start_ts && ev.end_ts) addCalendarSuggestion(ev);
-    } catch (e) { /* ignore malformed */ }
-  }
-}
-function addCalendarSuggestion(ev) {
-  const chat = $('chat');
-  const card = document.createElement('div');
-  card.className = 'cal-suggestion';
-  card.innerHTML =
-    '<div class="suggestion-title">📅 ' + escapeHtml(ev.title) + '</div>' +
-    '<div>' + escapeHtml(ev.start_ts) + ' → ' + escapeHtml(ev.end_ts) + '</div>' +
-    (ev.description ? '<div class="cal-event-desc">' + escapeHtml(ev.description) + '</div>' : '') +
-    '<button class="mini-btn" style="margin-top:6px">Add to Calendar</button>';
-  card.querySelector('button').onclick = async () => {
-    const r = await fetch('/api/events', {
-      method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify(ev)
-    });
-    const btn = card.querySelector('button');
-    if (r.ok) {
-      btn.textContent = '✓ Added';
-      btn.disabled = true;
-      if ($('tab-calendar').classList.contains('active')) loadEvents();
-    } else {
-      btn.textContent = 'Failed to add';
-    }
-  };
-  chat.appendChild(card);
-  chat.scrollTop = chat.scrollHeight;
-}
-
-// --- Calendar state ---
-let calCurrent = new Date();
-calCurrent.setDate(1);
-let calEvents = [];
-let calSelectedDate = new Date();
-
-function localISO(d) {
-  const p = n => String(n).padStart(2,'0');
-  return d.getFullYear() + '-' + p(d.getMonth()+1) + '-' + p(d.getDate()) +
-         'T' + p(d.getHours()) + ':' + p(d.getMinutes());
-}
-
-async function loadEvents() {
-  const y = calCurrent.getFullYear(), m = calCurrent.getMonth();
-  const start = localISO(new Date(y, m, 1));
-  const end = localISO(new Date(y, m + 1, 1));
-  try {
-    const r = await fetch('/api/events?start=' + encodeURIComponent(start) + '&end=' + encodeURIComponent(end));
-    const d = await r.json();
-    calEvents = d.events || [];
-    renderCalendar();
-  } catch (e) {
-    $('cal-grid').innerHTML = '<div class="cal-empty" style="grid-column:span 7;padding:20px">Failed to load events</div>';
-  }
-}
-
-function renderCalendar() {
-  const grid = $('cal-grid');
-  grid.innerHTML = '';
-  ['Sun','Mon','Tue','Wed','Thu','Fri','Sat'].forEach(d => {
-    const h = document.createElement('div');
-    h.className = 'cal-header-cell';
-    h.textContent = d;
-    grid.appendChild(h);
-  });
-  const y = calCurrent.getFullYear(), m = calCurrent.getMonth();
-  const firstDay = new Date(y, m, 1);
-  const gridStart = new Date(y, m, 1 - firstDay.getDay());
-  const today = new Date(); today.setHours(0,0,0,0);
-
-  for (let i = 0; i < 42; i++) {
-    const d = new Date(gridStart);
-    d.setDate(gridStart.getDate() + i);
-    const cell = document.createElement('div');
-    cell.className = 'cal-cell';
-    if (d.getMonth() !== m) cell.classList.add('cal-other-month');
-    if (d.getTime() === today.getTime()) cell.classList.add('cal-today');
-    if (d.toDateString() === calSelectedDate.toDateString()) cell.classList.add('cal-selected');
-
-    const num = document.createElement('div');
-    num.className = 'cal-day-num';
-    num.textContent = d.getDate();
-    cell.appendChild(num);
-
-    const dayEvents = calEvents.filter(e => new Date(e.start_ts).toDateString() === d.toDateString());
-    dayEvents.slice(0, 3).forEach(e => {
-      const pill = document.createElement('div');
-      pill.className = 'cal-event-pill';
-      pill.textContent = e.title;
-      cell.appendChild(pill);
-    });
-    if (dayEvents.length > 3) {
-      const more = document.createElement('div');
-      more.className = 'cal-event-more';
-      more.textContent = '+' + (dayEvents.length - 3) + ' more';
-      cell.appendChild(more);
-    }
-    cell.onclick = () => {
-      calSelectedDate = new Date(d);
-      renderCalendar();
-    };
-    grid.appendChild(cell);
-  }
-  $('cal-title').textContent = calCurrent.toLocaleDateString('en-US', {month: 'long', year: 'numeric'});
-  renderEventList();
-}
-
-function renderEventList() {
-  const list = $('cal-event-list');
-  list.innerHTML = '';
-  $('cal-selected-date').textContent =
-    calSelectedDate.toLocaleDateString('en-US', {weekday: 'long', month: 'long', day: 'numeric'});
-  const dayEvents = calEvents
-    .filter(e => new Date(e.start_ts).toDateString() === calSelectedDate.toDateString())
-    .sort((a,b) => a.start_ts.localeCompare(b.start_ts));
-  if (!dayEvents.length) {
-    list.innerHTML = '<div class="cal-empty">No events</div>';
-    return;
-  }
-  dayEvents.forEach(e => {
-    const s = new Date(e.start_ts), en = new Date(e.end_ts);
-    const row = document.createElement('div');
-    row.className = 'cal-event-row';
-    row.innerHTML =
-      '<div class="cal-event-time">' +
-        s.toLocaleTimeString('en-US', {hour:'2-digit', minute:'2-digit'}) + ' – ' +
-        en.toLocaleTimeString('en-US', {hour:'2-digit', minute:'2-digit'}) +
-      '</div>' +
-      '<div class="cal-event-title">' + escapeHtml(e.title) + '</div>' +
-      (e.description ? '<div class="cal-event-desc">' + escapeHtml(e.description) + '</div>' : '') +
-      '<div class="cal-event-actions">' +
-        '<button class="mini-btn" onclick="openEditEvent(' + e.id + ')">Edit</button>' +
-        '<button class="mini-btn danger" onclick="deleteEvent(' + e.id + ')">Delete</button>' +
-      '</div>';
-    list.appendChild(row);
-  });
-}
-
-function calPrev() { calCurrent.setMonth(calCurrent.getMonth() - 1); loadEvents(); }
-function calNext() { calCurrent.setMonth(calCurrent.getMonth() + 1); loadEvents(); }
-function calToday() {
-  const now = new Date();
-  calCurrent = new Date(now.getFullYear(), now.getMonth(), 1);
-  calSelectedDate = new Date(now);
-  loadEvents();
-}
-
-// --- Event modal ---
-function openNewEvent() {
-  $('event-modal-title').textContent = 'New Event';
-  $('event-id').value = '';
-  $('event-title').value = '';
-  const d = calSelectedDate;
-  const start = new Date(d); start.setHours(9, 0, 0, 0);
-  const end = new Date(d);   end.setHours(10, 0, 0, 0);
-  $('event-start').value = localISO(start);
-  $('event-end').value = localISO(end);
-  $('event-description').value = '';
-  $('event-modal').classList.add('open');
-  setTimeout(() => $('event-title').focus(), 30);
-}
-function openEditEvent(id) {
-  const e = calEvents.find(x => x.id === id);
-  if (!e) return;
-  $('event-modal-title').textContent = 'Edit Event';
-  $('event-id').value = e.id;
-  $('event-title').value = e.title;
-  $('event-start').value = e.start_ts.slice(0, 16);
-  $('event-end').value = e.end_ts.slice(0, 16);
-  $('event-description').value = e.description || '';
-  $('event-modal').classList.add('open');
-}
-function closeEventModal() { $('event-modal').classList.remove('open'); }
-async function saveEvent() {
-  const id = $('event-id').value;
-  const payload = {
-    title: $('event-title').value.trim(),
-    start_ts: $('event-start').value,
-    end_ts: $('event-end').value,
-    description: $('event-description').value.trim()
-  };
-  if (!payload.title || !payload.start_ts || !payload.end_ts) {
-    return alert('Title, start, and end are required');
-  }
-  const url = id ? '/api/events/' + id : '/api/events';
-  const method = id ? 'PUT' : 'POST';
-  const r = await fetch(url, {
-    method, headers: {'Content-Type':'application/json'}, body: JSON.stringify(payload)
-  });
-  if (!r.ok) return alert('Save failed');
-  closeEventModal();
-  loadEvents();
-}
-async function deleteEvent(id) {
-  if (!confirm('Delete this event?')) return;
-  await fetch('/api/events/' + id, {method: 'DELETE'});
-  loadEvents();
-}
-
-// --- Init ---
-$('input').addEventListener('keydown', e => {
-  if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) { e.preventDefault(); sendMessage(false); }
-});
-$('event-modal').addEventListener('click', e => {
-  if (e.target.id === 'event-modal') closeEventModal();
-});
-(async () => {
-  renderList($('persona-list'), PERSONALITIES, p => { selectedPersona = p; });
-  selectedPersona = selectFirst($('persona-list')) || PERSONALITIES[0] || null;
-  await loadModels();
-  try {
-    const r = await fetch('/api/history'); const d = await r.json();
-    updateMemory(d.messages.length);
-  } catch (e) {}
-})();
-</script></body></html>
-"""
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=5000, threaded=True)
+    root = tk.Tk()
+    app = LocalAIApp(root)
+    root.mainloop()
