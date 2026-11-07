@@ -17,20 +17,22 @@ No data ever leaves your machine.
 
 This project is modularized for maintainability, separating business logic from the user interface.
 
+## Project Structure
 
-product/
-├── app.py                 # Main entry point & orchestrator
-├── config/                # Easy-to-edit configuration files
-│   ├── models.txt         # List of Ollama models to load
-│   └── personalities.txt  # Custom AI personas
-├── core/                  # Business logic & data layer
-│   ├── db.py              # SQLite database operations
-│   ├── parsing.py         # JSON & timestamp parsing logic
-│   ├── context.py         # System prompt builders
-│   └── reminders.py       # Background ntfy notification service
-├── ui/                    # Tkinter User Interface
-│   ├── chat.py            # Chat tab & Markdown rendering
-│   ├── calendar.py        # Calendar tab
-│   ├── tasks.py           # Tasks tab
-│   └── sidebar.py         # Sidebar navigation & settings
-└── data/                  # (Auto-generated) Local database & history
+This project is modularized for maintainability, separating business logic from the user interface.
+
+- **`app.py`** - Main entry point & orchestrator
+- **`config/`** - Easy-to-edit configuration files
+  - `models.txt` - List of Ollama models to load
+  - `personalities.txt` - Custom AI personas
+- **`core/`** - Business logic & data layer
+  - `db.py` - SQLite database operations
+  - `parsing.py` - JSON & timestamp parsing logic
+  - `context.py` - System prompt builders
+  - `reminders.py` - Background ntfy notification service
+- **`ui/`** - Tkinter User Interface
+  - `chat.py` - Chat tab & Markdown rendering
+  - `calendar.py` - Calendar tab
+  - `tasks.py` - Tasks tab
+  - `sidebar.py` - Sidebar navigation & settings
+- **`data/`** - (Auto-generated) Local database & history
