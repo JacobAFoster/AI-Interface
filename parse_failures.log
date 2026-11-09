@@ -1,0 +1,81 @@
+============================================================
+TIMESTAMP: 2026-11-07T21:22:40.286398
+It seems like you've entered some random text. Could you please provide more information or clarify what you'd like to do? I'll do my best to assist you.
+
+If you meant to type something, feel free to try again. If not, I can help with a different topic or provide assistance with the calendar and task functionality if you'd like.
+============================================================
+TIMESTAMP: 2026-11-07T22:12:39.964924
+```batch
+[
+  {
+    "title": "Fix JSON string splitting in core/parsing.py",
+    "description": "Ensure backslash escapes are handled correctly in _split_json_strings.",
+    "due_ts": "",
+    "priority": "high",
+    "reminder_minutes": 30
+  },
+  {
+    "title": "Update exception handling in core/db.py",
+    "description": "Change _db() context manager to use BaseException for rollback on KeyboardInterrupt and SystemExit.",
+    "due_ts": "",
+    "priority": "high",
+    "reminder_minutes": 30
+  },
+  {
+    "title": "Fix notifier config file handling in core/reminders.py",
+    "description": "Write to a temporary file first, then use os.replace() for atomic swap in _save_notifier_config.",
+    "due_ts": "",
+    "priority": "high",
+    "reminder_minutes": 30
+  },
+  {
+    "title": "Fix URL parsing in ui/chat.py",
+    "description": "Get the exact clicked word/character to open the correct URL in _open_link.",
+    "due_ts": "",
+    "priority": "high",
+    "reminder_minutes": 30
+  },
+  {
+    "title": "Update regex for code blocks in ui/chat.py",
+    "description": "Support both ``` and ~~~ for code blocks in _insert_markdown and strip the correct number of characters.",
+    "due_ts": "",
+    "priority": "high",
+    "reminder_minutes": 30
+  },
+  {
+    "title": "Optimize date selection rendering in ui/calendar.py",
+    "description": "Change _select_date to call _render_side() instead of _render() for better performance.",
+    "due_ts": "",
+    "priority": "high",
+    "reminder_minutes": 30
+  },
+  {
+    "title": "Update default seed in app.py",
+    "description": "Change the default fallback for _ollama_stream from 0 to -1 for better alignment with Ollama's API expectations.",
+    "due_ts": "",
+    "priority": "high",
+    "reminder_minutes": 30
+  },
+  {
+    "title": "Fix raw string comparison in core/context.py",
+    "description": "Convert both sides of the comparison to datetime objects for robust date range filtering in _calendar_context.",
+    "due_ts": "",
+    "priority": "high",
+    "reminder_minutes": 30
+  },
+  {
+    "title": "Add suppression flag for redundant config saves in ui/sidebar.py",
+    "description": "Introduce a self._suppress_selection flag to prevent redundant config saves during programmatic listbox selection.",
+    "due_ts": "",
+    "priority": "high",
+    "reminder_minutes": 30
+  },
+  {
+    "title": "Handle database write failures in ui/tasks.py",
+    "description": "Update _toggle to try/except and refresh the task list if the database write fails, ensuring the checkbox UI is accurate.",
+    "due_ts": "",
+    "priority": "high",
+    "reminder_minutes": 30
+  }
+]
+```

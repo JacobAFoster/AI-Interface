@@ -2,11 +2,19 @@
 import re
 from datetime import datetime, timedelta
 
-from .db import _db, DEFAULT_REMINDER_MINUTES
+from .db import _db, DEFAULT_REMINDER_MINUTES, _load_app_config
 from .parsing import _safe_event_text
 
 
-def _calendar_context():
+def _calendar_context(default_reminder_minutes=None):
+    if default_reminder_minutes is None:
+        try:
+            default_reminder_minutes = int(
+                _load_app_config().get("default_reminder_minutes", DEFAULT_REMINDER_MINUTES)
+            )
+        except Exception:
+            default_reminder_minutes = DEFAULT_REMINDER_MINUTES
+
     now = datetime.now()
     horizon = now + timedelta(days=14)
     with _db() as conn:
@@ -70,7 +78,7 @@ def _calendar_context():
         "fenced code block tagged 'calendar' containing a single JSON object with keys "
         "title, start_ts, end_ts, description, reminder_minutes. Use LOCAL time in "
         "format YYYY-MM-DDTHH:MM. reminder_minutes is an integer (minutes before start; "
-        f"default {DEFAULT_REMINDER_MINUTES}; 0 disables reminders). Example:\n"
+        f"default {default_reminder_minutes}; 0 disables reminders). Example:\n"
         "```calendar\n"
         '{"title": "Team sync", "start_ts": "2025-01-15T14:00", '
         '"end_ts": "2025-01-15T14:30", "description": "Weekly sync", '
@@ -94,7 +102,7 @@ def _calendar_context():
         "with keys: title (required), description (optional), due_ts (optional, local "
         "time YYYY-MM-DDTHH:MM), priority (optional: 'low', 'normal', or 'high', "
         "default 'normal'), reminder_minutes (optional integer, minutes before due; "
-        f"default {DEFAULT_REMINDER_MINUTES}; 0 disables reminders). Example:\n"
+        f"default {default_reminder_minutes}; 0 disables reminders). Example:\n"
         "```task\n"
         '{"title": "Buy groceries", "due_ts": "2025-01-15T18:00", '
         '"priority": "high", "description": "Milk, eggs, bread", '
@@ -117,5 +125,17 @@ def _code_output_rules(query):
             "If it doesn't fit, say so and stop.\n"
             "- Otherwise: return a unified diff with 3 lines of context. "
             "Never paraphrase unchanged code.\n"
+                    "[Batch Task creation]\n"
+        "If the user provides a list of code changes to make, or asks you to "
+        "audit the code and suggest changes, output a fenced code block tagged "
+        "'batch'. It must contain a JSON array of objects with exactly two "
+        "keys: 'file' (the relative path, e.g. 'core/db.py') and 'task' (the "
+        "description of what to do). Example:\n"
+        "```batch\n"
+        '[\n'
+        '  {"file": "core/db.py", "task": "Add a try/except block around the db connection"},\n'
+        '  {"file": "ui/chat.py", "task": "Change the send button color to blue"}\n'
+        ']\n'
+        "```\n"
         )
     return ""

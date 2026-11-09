@@ -6,7 +6,7 @@ from core.db import (
     DEFAULT_REMINDER_MINUTES,
     _get_tasks, _add_task, _update_task, _toggle_task, _delete_task,
 )
-from core.parsing import _normalize_ts
+from core.parsing import _parse_ts_strict
 
 
 class TaskTab(ttk.Frame):
@@ -44,6 +44,32 @@ class TaskTab(ttk.Frame):
         self._canvas.configure(yscrollcommand=scrollbar.set)
         self._canvas.pack(side=tk.LEFT, fill="both", expand=True)
         scrollbar.pack(side=tk.RIGHT, fill="y")
+
+        self._bind_mousewheel(container, self._canvas)
+
+    def _bind_mousewheel(self, region, canvas):
+        def _handler(e):
+            w = e.widget
+            try:
+                while w is not None:
+                    if w is region:
+                        break
+                    w = w.master
+                if w is None:
+                    return
+            except Exception:
+                return
+            if getattr(e, "num", None) == 4:
+                canvas.yview_scroll(-1, "units")
+            elif getattr(e, "num", None) == 5:
+                canvas.yview_scroll(1, "units")
+            else:
+                delta = getattr(e, "delta", 0)
+                canvas.yview_scroll(int(-1 * (delta / 120)), "units")
+
+        self.bind_all("<MouseWheel>", _handler, add="+")
+        self.bind_all("<Button-4>", _handler, add="+")
+        self.bind_all("<Button-5>", _handler, add="+")
 
     # --- Render -----------------------------------------------------------
     def refresh(self):
@@ -162,7 +188,7 @@ class TaskTab(ttk.Frame):
         if task is not None and task.get("reminder_minutes") is not None:
             rm_val = str(task.get("reminder_minutes"))
         else:
-            rm_val = str(DEFAULT_REMINDER_MINUTES)
+            rm_val = str(self.app.app_config.get("default_reminder_minutes", 30))
         reminder_var = tk.StringVar(value=rm_val)
         ttk.Entry(row3b, textvariable=reminder_var, width=10).pack(side=tk.LEFT)
         ttk.Label(row3b, text="  minutes before due (0 = off)",
@@ -180,10 +206,14 @@ class TaskTab(ttk.Frame):
                 t = title_var.get().strip()
                 if not t:
                     raise ValueError("Title is required")
+
                 due_raw = due_var.get().strip()
-                due_norm = _normalize_ts(due_raw) if due_raw else None
-                if due_raw and not due_norm:
-                    raise ValueError("Due date must be YYYY-MM-DD HH:MM")
+                due_norm = None
+                if due_raw:
+                    due_norm = _parse_ts_strict(due_raw)
+                    if not due_norm:
+                        raise ValueError("Due date must be a valid YYYY-MM-DD HH:MM")
+
                 rm_raw = reminder_var.get().strip()
                 try:
                     rm_int = int(rm_raw)
@@ -191,6 +221,7 @@ class TaskTab(ttk.Frame):
                     raise ValueError("Remind must be a whole number of minutes")
                 if rm_int < 0 or rm_int > 10080:
                     raise ValueError("Remind must be between 0 and 10080 minutes")
+
                 d = desc_text.get("1.0", "end-1c").strip()
                 prio = prio_var.get() or "normal"
                 if task:

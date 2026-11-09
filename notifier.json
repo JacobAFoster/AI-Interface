@@ -1,0 +1,8 @@
+{
+  "enabled": false,
+  "ntfy_topic": "",
+  "lead_minutes": [
+    15,
+    60
+  ]
+}

@@ -1,0 +1,4 @@
+Code Review = Review the following code for bugs, performance issues, and security vulnerabilities. Provide a corrected version.
+Explain Like I'm 5 = Explain the following concept in simple terms that a 5-year-old could understand.
+Write Unit Tests = Write comprehensive unit tests for the following code using Python's standard unittest module.
+Summarize = Summarize the following text into 5 key bullet points.

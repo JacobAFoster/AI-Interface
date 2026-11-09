@@ -5,7 +5,7 @@ from tkinter import ttk, messagebox
 from datetime import datetime, timedelta
 
 from core.db import _db, DEFAULT_REMINDER_MINUTES
-from core.parsing import _normalize_ts
+from core.parsing import _parse_ts_strict
 
 
 class CalendarTab(ttk.Frame):
@@ -33,22 +33,21 @@ class CalendarTab(ttk.Frame):
 
         main = ttk.Frame(self)
         main.pack(fill="both", expand=True)
-        self.grid_frame = tk.Frame(main, bg="#333")
+        self.grid_frame = tk.Frame(main, bg=self.app.theme["border"])
         self.grid_frame.pack(side=tk.LEFT, fill="both", expand=True)
         for i in range(7):
             self.grid_frame.columnconfigure(i, weight=1, uniform="cal")
         for i in range(7):
             self.grid_frame.rowconfigure(i, weight=(0 if i == 0 else 1), uniform="calrow")
 
-        side = tk.Frame(main, bg="#252526", width=290)
+        side = tk.Frame(main, bg=self.app.theme["bg_panel"], width=290)
         side.pack(side=tk.RIGHT, fill="y", padx=(8, 0))
         side.pack_propagate(False)
-        self.side_date_label = tk.Label(side, text="", bg="#252526", fg="#4ec9b0",
-                                        font=("Segoe UI", 11, "bold"), anchor="w")
+        self.side_date_label = tk.Label(side, text="", bg=self.app.theme["bg_panel"], fg=self.app.theme["accent_teal"], font=("Segoe UI", 11, "bold"), anchor="w")
         self.side_date_label.pack(fill="x", padx=10, pady=(10, 6))
-        canvas = tk.Canvas(side, bg="#252526", highlightthickness=0)
+        canvas = tk.Canvas(side, bg=self.app.theme["bg_panel"], highlightthickness=0)
         scrollbar = ttk.Scrollbar(side, orient="vertical", command=canvas.yview)
-        self.side_inner = tk.Frame(canvas, bg="#252526")
+        self.side_inner = tk.Frame(canvas, bg=self.app.theme["bg_panel"])
         self.side_inner.bind("<Configure>",
                              lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
         canvas.create_window((0, 0), window=self.side_inner, anchor="nw")
@@ -56,7 +55,32 @@ class CalendarTab(ttk.Frame):
         canvas.pack(side=tk.LEFT, fill="both", expand=True, padx=(10, 0), pady=(0, 10))
         scrollbar.pack(side=tk.RIGHT, fill="y", pady=(0, 10), padx=(0, 6))
 
-    # --- Navigation -------------------------------------------------------
+        self._bind_side_mousewheel(side, canvas)
+
+    def _bind_side_mousewheel(self, region, canvas):
+        def _handler(e):
+            w = e.widget
+            try:
+                while w is not None:
+                    if w is region:
+                        break
+                    w = w.master
+                if w is None:
+                    return
+            except Exception:
+                return
+            if getattr(e, "num", None) == 4:
+                canvas.yview_scroll(-1, "units")
+            elif getattr(e, "num", None) == 5:
+                canvas.yview_scroll(1, "units")
+            else:
+                delta = getattr(e, "delta", 0)
+                canvas.yview_scroll(int(-1 * (delta / 120)), "units")
+
+        self.bind_all("<MouseWheel>", _handler, add="+")
+        self.bind_all("<Button-4>", _handler, add="+")
+        self.bind_all("<Button-5>", _handler, add="+")
+
     def _prev_month(self):
         self.current_month = (self.current_month - timedelta(days=1)).replace(day=1)
         self.refresh()
@@ -82,9 +106,8 @@ class CalendarTab(ttk.Frame):
 
     def _select_date(self, d):
         self.selected_date = d.replace(hour=0, minute=0, second=0, microsecond=0)
-        self._render()
+        self._render_side()
 
-    # --- Data -------------------------------------------------------------
     def refresh(self):
         y, m = self.current_month.year, self.current_month.month
         first = datetime(y, m, 1)
@@ -106,13 +129,12 @@ class CalendarTab(ttk.Frame):
         de = day_end.strftime("%Y-%m-%dT%H:%M")
         return [e for e in self.events_cache if e["start_ts"] < de and e["end_ts"] > ds]
 
-    # --- Render -----------------------------------------------------------
     def _render(self):
         self.title_label.config(text=self.current_month.strftime("%B %Y"))
         for w in self.grid_frame.winfo_children():
             w.destroy()
         for i, day_name in enumerate(["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"]):
-            tk.Label(self.grid_frame, text=day_name, bg="#252526", fg="#888",
+            tk.Label(self.grid_frame, text=day_name, bg=self.app.theme["bg_panel"], fg=self.app.theme["fg_muted"],
                      font=("Segoe UI", 8, "bold")).grid(
                          row=0, column=i, sticky="nsew", padx=1, pady=1)
 
@@ -128,25 +150,25 @@ class CalendarTab(ttk.Frame):
             is_today = d.date() == today.date()
             is_sel = d.date() == self.selected_date.date()
 
-            bg = "#181818" if is_other else "#1e1e1e"
-            border_color = "#0e639c" if is_sel else "#333"
+            bg = self.app.theme["bg_card"] if is_other else self.app.theme["bg_main"]
+            border_color = self.app.theme["accent_blue"] if is_sel else self.app.theme["border"]
             cell = tk.Frame(self.grid_frame, bg=bg,
                             highlightthickness=2 if is_sel else 1,
                             highlightbackground=border_color, highlightcolor=border_color)
             cell.grid(row=row, column=col, sticky="nsew", padx=1, pady=1)
 
-            num_bg = "#0e639c" if is_today else bg
-            num_fg = "#fff" if is_today else ("#666" if is_other else "#d4d4d4")
+            num_bg = self.app.theme["accent_blue"] if is_today else bg
+            num_fg = "#fff" if is_today else (self.app.theme["fg_muted"] if is_other else self.app.theme["fg_main"])
             tk.Label(cell, text=str(d.day), bg=num_bg, fg=num_fg,
                      font=("Segoe UI", 9, "bold"), anchor="w").pack(
                          fill="x", padx=4, pady=(3, 2))
 
             evs = self._events_for_day(d)
             for ev in evs[:2]:
-                tk.Label(cell, text=ev["title"][:14], bg="#0e639c", fg="white",
+                tk.Label(cell, text=ev["title"][:14], bg=self.app.theme["accent_blue"], fg="white",
                          font=("Segoe UI", 7), anchor="w").pack(fill="x", padx=2)
             if len(evs) > 2:
-                tk.Label(cell, text=f"+{len(evs) - 2} more", bg=bg, fg="#888",
+                tk.Label(cell, text=f"+{len(evs) - 2} more", bg=bg, fg=self.app.theme["fg_muted"],
                          font=("Segoe UI", 7), anchor="w").pack(fill="x", padx=4)
 
             for w in [cell] + list(cell.winfo_children()):
@@ -159,12 +181,12 @@ class CalendarTab(ttk.Frame):
             w.destroy()
         events = self._events_for_day(self.selected_date)
         if not events:
-            tk.Label(self.side_inner, text="No events", bg="#252526", fg="#666",
+            tk.Label(self.side_inner, text="No events", bg=self.app.theme["bg_panel"], fg=self.app.theme["fg_muted"],
                      font=("Segoe UI", 9, "italic")).pack(anchor="w", pady=8)
             return
         for ev in events:
-            card = tk.Frame(self.side_inner, bg="#1e1e1e",
-                            highlightthickness=1, highlightbackground="#333")
+            card = tk.Frame(self.side_inner, bg=self.app.theme["bg_main"],
+                            highlightthickness=1, highlightbackground=self.app.theme["border"])
             card.pack(fill="x", pady=4)
             try:
                 s = datetime.strptime(ev["start_ts"], "%Y-%m-%dT%H:%M")
@@ -172,25 +194,25 @@ class CalendarTab(ttk.Frame):
                 tstr = f"{s.strftime('%H:%M')} – {en.strftime('%H:%M')}"
             except Exception:
                 tstr = f"{ev['start_ts']} → {ev['end_ts']}"
-            tk.Label(card, text=tstr, bg="#1e1e1e", fg="#888",
+            tk.Label(card, text=tstr, bg=self.app.theme["bg_main"], fg=self.app.theme["fg_muted"],
                      font=("Consolas", 8), anchor="w").pack(
                          fill="x", padx=8, pady=(6, 0))
-            tk.Label(card, text=ev["title"], bg="#1e1e1e", fg="#d4d4d4",
+            tk.Label(card, text=ev["title"], bg=self.app.theme["bg_main"], fg=self.app.theme["fg_main"],
                      font=("Segoe UI", 9, "bold"), anchor="w",
                      wraplength=250, justify="left").pack(fill="x", padx=8)
             rm = ev.get("reminder_minutes")
             if rm is not None:
                 rm_txt = f"🔔 {rm} min before" if rm > 0 else "🔕 reminders off"
-                rm_color = "#4ec9b0" if rm > 0 else "#888"
-                tk.Label(card, text=rm_txt, bg="#1e1e1e", fg=rm_color,
+                rm_color = self.app.theme["accent_teal"] if rm > 0 else self.app.theme["fg_muted"]
+                tk.Label(card, text=rm_txt, bg=self.app.theme["bg_main"], fg=rm_color,
                          font=("Segoe UI", 8), anchor="w").pack(
                              fill="x", padx=8, pady=(2, 0))
             if ev.get("description"):
-                tk.Label(card, text=ev["description"], bg="#1e1e1e", fg="#aaa",
+                tk.Label(card, text=ev["description"], bg=self.app.theme["bg_main"], fg=self.app.theme["fg_muted"],
                          font=("Segoe UI", 8), anchor="w",
                          wraplength=250, justify="left").pack(
                              fill="x", padx=8, pady=(2, 0))
-            btn_row = tk.Frame(card, bg="#1e1e1e")
+            btn_row = tk.Frame(card, bg=self.app.theme["bg_main"])
             btn_row.pack(fill="x", padx=8, pady=(4, 6))
             ttk.Button(btn_row, text="Edit", width=6,
                        command=lambda e=ev: self._open_event_dialog(e)).pack(side=tk.LEFT)
@@ -198,7 +220,6 @@ class CalendarTab(ttk.Frame):
                        command=lambda e=ev: self._delete_event(e)).pack(
                            side=tk.LEFT, padx=(4, 0))
 
-    # --- CRUD -------------------------------------------------------------
     def _delete_event(self, ev):
         if not messagebox.askyesno("Delete Event", f"Delete '{ev['title']}'?"):
             return
@@ -243,7 +264,7 @@ class CalendarTab(ttk.Frame):
         if event is not None and event.get("reminder_minutes") is not None:
             rm_val = str(event.get("reminder_minutes"))
         else:
-            rm_val = str(DEFAULT_REMINDER_MINUTES)
+            rm_val = str(self.app.app_config.get("default_reminder_minutes", 30))
         reminder_var = tk.StringVar(value=rm_val)
         ttk.Entry(row3b, textvariable=reminder_var, width=10).pack(side=tk.LEFT)
         ttk.Label(row3b, text="  minutes before start (0 = off)",
@@ -251,7 +272,7 @@ class CalendarTab(ttk.Frame):
 
         row4 = ttk.Frame(dlg); row4.pack(fill="x", **pad)
         ttk.Label(row4, text="Description:").pack(anchor="w")
-        desc_text = tk.Text(dlg, height=3, width=55, wrap=tk.WORD)
+        desc_text = tk.Text(dlg, height=3, width=55, wrap=tk.WORD, bg=self.app.theme["bg_panel"], fg=self.app.theme["fg_main"])
         desc_text.pack(fill="x", padx=10, pady=(0, 6))
         if event:
             desc_text.insert("1.0", event.get("description", ""))
@@ -263,10 +284,16 @@ class CalendarTab(ttk.Frame):
                 e_raw = end_var.get().strip()
                 if not t:
                     raise ValueError("Title is required")
-                if not re.match(r"^\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}", s_raw):
-                    raise ValueError("Start must be YYYY-MM-DD HH:MM")
-                if not re.match(r"^\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}", e_raw):
-                    raise ValueError("End must be YYYY-MM-DD HH:MM")
+
+                s = _parse_ts_strict(s_raw)
+                en = _parse_ts_strict(e_raw)
+                if not s:
+                    raise ValueError("Start must be a valid date/time (YYYY-MM-DD HH:MM)")
+                if not en:
+                    raise ValueError("End must be a valid date/time (YYYY-MM-DD HH:MM)")
+                if en <= s:
+                    raise ValueError("End must be after start")
+
                 rm_raw = reminder_var.get().strip()
                 try:
                     rm_int = int(rm_raw)
@@ -275,8 +302,6 @@ class CalendarTab(ttk.Frame):
                 if rm_int < 0 or rm_int > 10080:
                     raise ValueError("Remind must be between 0 and 10080 minutes")
 
-                s = _normalize_ts(s_raw)
-                en = _normalize_ts(e_raw)
                 d = desc_text.get("1.0", "end-1c").strip()
                 with _db() as conn:
                     if event:

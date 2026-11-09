@@ -1,6 +1,17 @@
 {
-  "model": "llama3.2:1b",
+  "model": "qwen2.5-coder:7b",
   "persona": "(None \u2014 default assistant)",
+  "ollama_url": "http://localhost:11434/api/chat",
   "allow_auto_pull": true,
-  "window_geometry": "1280x840+130+130"
+  "num_ctx": 25000,
+  "max_history_messages": 20,
+  "temperature": 0.2,
+  "top_p": 0.9,
+  "repeat_penalty": 1.05,
+  "default_reminder_minutes": 30,
+  "num_predict": -1,
+  "top_k": 40,
+  "seed": 0,
+  "chat_font_size": 10,
+  "theme": "dark"
 }

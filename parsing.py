@@ -8,19 +8,6 @@ from .db import PARSE_LOG, PARSE_LOG_MAX_BYTES, DEFAULT_REMINDER_MINUTES
 
 
 # --- Timestamp parsing ---------------------------------------------------
-def _normalize_ts(s):
-    if not s:
-        return None
-    s = s.strip()
-    for fmt in ("%Y-%m-%dT%H:%M", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%d %H:%M",
-                "%Y-%m-%d", "%Y-%m-%dT%H:%M:%S.%f"):
-        try:
-            return datetime.strptime(s, fmt).strftime("%Y-%m-%dT%H:%M")
-        except ValueError:
-            continue
-    return s
-
-
 def _parse_ts_strict(s):
     if not s:
         return None
@@ -34,6 +21,11 @@ def _parse_ts_strict(s):
         except ValueError:
             continue
     return None
+
+
+def _normalize_ts(s):
+    """Backward-compat alias for _parse_ts_strict (returns None on failure)."""
+    return _parse_ts_strict(s)
 
 
 def _parse_ts_relaxed(s):
@@ -95,7 +87,14 @@ def _parse_ts_relaxed(s):
 
     if base is None and hour is None:
         return None
-    dt = (base or now).replace(hour=hour or 0, minute=minute, second=0, microsecond=0)
+
+    if base is None and hour is not None:
+        dt_candidate = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+        if dt_candidate <= now:
+            dt_candidate += timedelta(days=1)
+        return dt_candidate.strftime("%Y-%m-%dT%H:%M")
+
+    dt = base.replace(hour=hour or 0, minute=minute, second=0, microsecond=0)
     return dt.strftime("%Y-%m-%dT%H:%M")
 
 
@@ -173,6 +172,35 @@ def _strip_json_comments(s):
     return "".join(out)
 
 
+def _split_json_strings(s):
+    parts = []
+    i, n = 0, len(s)
+    buf = []
+    while i < n:
+        c = s[i]
+        if c == '"':
+            if buf:
+                parts.append((False, "".join(buf)))
+                buf = []
+            j = i + 1
+            while j < n:
+                if s[j] == "\\":
+                    j += 2
+                    continue
+                if s[j] == '"':
+                    j += 1
+                    break
+                j += 1
+            parts.append((True, s[i:j]))
+            i = j
+        else:
+            buf.append(c)
+            i += 1
+    if buf:
+        parts.append((False, "".join(buf)))
+    return parts
+
+
 def _normalize_json_text(s):
     if not s:
         return s
@@ -185,11 +213,21 @@ def _normalize_json_text(s):
         "\u00a0": " ",
     }
     s = s.translate(str.maketrans(trans))
-    s = re.sub(r'([{,]\s*)([A-Za-z_][A-Za-z0-9_]*)(\s*:)', r'\1"\2"\3', s)
-    s = re.sub(r'(:\s*)(\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}(?::\d{2})?)(\s*[,}])',
-               r'\1"\2"\3', s)
-    s = re.sub(r',(\s*[}\]])', r'\1', s)
-    return s
+
+    out = []
+    for is_str, chunk in _split_json_strings(s):
+        if is_str:
+            out.append(chunk)
+            continue
+        chunk = re.sub(
+            r'([{,]\s*)([A-Za-z_][A-Za-z0-9_]*)(\s*:)',
+            r'\1"\2"\3', chunk)
+        chunk = re.sub(
+            r'(:\s*)(\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}(?::\d{2})?(?:\.\d+)?)(\s*[,}])',
+            r'\1"\2"\3', chunk)
+        chunk = re.sub(r',(\s*[}\]])', r'\1', chunk)
+        out.append(chunk)
+    return "".join(out)
 
 
 def _safe_event_text(s):
@@ -392,4 +430,50 @@ def _extract_task_blocks(text):
             block = block[4:].lstrip()
         for obj in _find_json_objects(block):
             _try(obj)
+    return tasks
+
+
+def _extract_batch_tasks(text):
+    """Extracts tasks from ```batch blocks."""
+    tasks = []
+    text = _normalize_json_text(text)
+    
+    for m in re.finditer(r"```\s*batch\b[^\n]*\n?(.*?)```", text, re.DOTALL | re.IGNORECASE):
+        block = m.group(1).strip()
+        block = _strip_json_comments(block)
+        if block.lower().startswith("json"):
+            block = block[4:].lstrip()
+            
+        # Try parsing as a clean JSON array/object first
+        try:
+            data = json.loads(block)
+            if isinstance(data, list):
+                for item in data:
+                    if isinstance(item, dict) and "file" in item and "task" in item:
+                        tasks.append({
+                            "file": str(item["file"]).strip(),
+                            "task": str(item["task"]).strip()
+                        })
+                continue
+            elif isinstance(data, dict) and "file" in data and "task" in data:
+                tasks.append({
+                    "file": str(data["file"]).strip(),
+                    "task": str(data["task"]).strip()
+                })
+                continue
+        except json.JSONDecodeError:
+            pass
+            
+        # Fallback: find any valid JSON objects inside the block
+        for obj in _find_json_objects(block):
+            try:
+                data = json.loads(obj)
+                if isinstance(data, dict) and "file" in data and "task" in data:
+                    tasks.append({
+                        "file": str(data["file"]).strip(),
+                        "task": str(data["task"]).strip()
+                    })
+            except Exception:
+                pass
+                
     return tasks
