@@ -1,5 +1,5 @@
 {
-  "model": "qwen2.5-coder:7b",
+  "model": "llama3.2:1b",
   "persona": "(None \u2014 default assistant)",
   "ollama_url": "http://localhost:11434/api/chat",
   "allow_auto_pull": true,
@@ -13,5 +13,6 @@
   "top_k": 40,
   "seed": 0,
   "chat_font_size": 10,
-  "theme": "dark"
+  "theme": "dark",
+  "window_geometry": "1280x840+52+52"
 }

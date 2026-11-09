@@ -1,0 +1,15 @@
+.venv/
+venv/
+__pycache__/
+*.pyc
+*.pyo
+
+data/*
+!data/.gitkeep
+
+build/
+dist/
+*.spec
+
+.DS_Store
+Thumbs.db

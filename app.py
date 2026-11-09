@@ -2,6 +2,7 @@
 import os
 import json
 import time
+import queue
 import threading
 import subprocess
 import urllib.request
@@ -27,10 +28,13 @@ from core.context import _calendar_context, _code_output_rules
 from core.reminders import (
     ReminderService, _load_notifier_config, _save_notifier_config, _send_ntfy,
 )
+from ui.theme import get_theme, apply_ttk_theme            # ─── NEW
 from ui.sidebar import Sidebar
+from ui.dashboard import DashboardTab                    # ─── NEW
 from ui.chat import ChatPanel
 from ui.calendar import CalendarTab
 from ui.tasks import TaskTab
+from ui.batch_tab import BatchTab                        # ─── NEW
 
 
 class LocalAIApp:
@@ -52,7 +56,6 @@ class LocalAIApp:
         self.root.geometry(saved_geo if saved_geo else "1280x840")
 
         style = ttk.Style()
-        style.theme_use("clam")
 
         # ---- State ----
         self.personalities = {}
@@ -60,6 +63,15 @@ class LocalAIApp:
 
         self.notifier_config = _load_notifier_config()
         self.app_config = _load_app_config()
+
+        # ─── NEW: theme must be initialised BEFORE any widget that reads
+        #     self.app.theme (Sidebar, ChatPanel, CalendarTab, TasksTab,
+        #     DashboardTab, BatchTab all reference it).
+        self.theme = get_theme(self.app_config)
+        apply_ttk_theme(self.root, style, self.theme)
+
+        # ─── NEW: cross-thread UI message bus used by DashboardTab & BatchTab.
+        self.ui_queue = queue.Queue()
 
         self._notifier_save_id = None
         self.current_model = tk.StringVar(value="")
@@ -81,6 +93,10 @@ class LocalAIApp:
         self.notebook = ttk.Notebook(self.root)
         self.notebook.grid(row=0, column=1, sticky="nsew")
 
+        # ─── NEW: Dashboard first (home screen per README)
+        self.dashboard_tab = DashboardTab(self.notebook, self)
+        self.notebook.add(self.dashboard_tab, text="🏠 Dashboard")
+
         self.chat_panel = ChatPanel(self.notebook, self)
         self.notebook.add(self.chat_panel, text="💬 Chat")
 
@@ -90,7 +106,14 @@ class LocalAIApp:
         self.tasks_tab = TaskTab(self.notebook, self)
         self.notebook.add(self.tasks_tab, text="📋 Tasks")
 
+        # ─── NEW: Batch coder tab
+        self.batch_tab = BatchTab(self.notebook, self)
+        self.notebook.add(self.batch_tab, text="🛠 Batch")
+
         self.notebook.bind("<<NotebookTabChanged>>", self._on_tab_changed)
+
+        # ─── NEW: start the UI-queue pump (handles Dashboard & Batch events)
+        self.root.after(100, self._drain_ui_queue)
 
         # ---- Background service ----
         self.reminder_service = ReminderService(self)
@@ -111,10 +134,143 @@ class LocalAIApp:
 
         self.load_and_sync_models()
 
+        # Default to the Dashboard tab
+        try:
+            self.notebook.select(self.dashboard_tab)
+        except Exception:
+            pass
+
         if self.notifier_config.get("enabled") and self.notifier_config.get("ntfy_topic"):
             self.root.after(1500, lambda: self.flash_status(
                 f"🔔 Reminders active on topic '{self.notifier_config['ntfy_topic']}'",
                 "green", 4000))
+
+    # ─── NEW: UI queue pump ──────────────────────────────────────────────
+    def _drain_ui_queue(self):
+        """Consume messages from background threads on the Tk main thread.
+
+        Handles three shapes:
+          - bare callable            (ReminderService._post_to_ui)
+          - ("batch_event", ev, p)   (BatchTab._emit_event)
+          - ("dashboard_net"|"dashboard_weather", payload)  (DashboardTab)
+        """
+        try:
+            while True:
+                try:
+                    item = self.ui_queue.get_nowait()
+                except queue.Empty:
+                    break
+
+                if item is None:
+                    continue
+
+                # Bare callable from ReminderService
+                if callable(item) and not isinstance(item, tuple):
+                    try:
+                        item()
+                    except Exception as e:
+                        print(f"UI callback error: {e}")
+                    continue
+
+                if isinstance(item, tuple) and item:
+                    kind = item[0]
+                    if kind == "batch_event" and len(item) == 3:
+                        _, event_type, payload = item
+                        if hasattr(self, "batch_tab"):
+                            try:
+                                self.batch_tab.handle_event(event_type, payload)
+                            except Exception as e:
+                                print(f"Batch event error: {e}")
+                    elif kind in ("dashboard_net", "dashboard_weather") and len(item) == 2:
+                        if hasattr(self, "dashboard_tab"):
+                            try:
+                                self.dashboard_tab.handle_ui_event(kind, item[1])
+                            except Exception as e:
+                                print(f"Dashboard event error: {e}")
+        except Exception as e:
+            print(f"UI queue drain error: {e}")
+        finally:
+            self.root.after(100, self._drain_ui_queue)
+
+    # ─── NEW: one-shot blocking completion for the Batch tab ─────────────
+    def stream_completion(self, prompt, on_chunk=None, model=None):
+        """Blocking single-turn completion against Ollama.
+
+        Used by BatchTab._llm_call. Runs on a background thread there, so
+        the `on_chunk` callback must be thread-safe (BatchTab's emitter
+        just puts onto `self.ui_queue`).
+        """
+        model = model or self.current_model.get()
+        if not model:
+            raise ValueError("No model selected for batch completion")
+
+        try:
+            temperature = float(self.app_config.get("temperature", 0.2))
+        except (TypeError, ValueError):
+            temperature = 0.2
+        try:
+            top_p = float(self.app_config.get("top_p", 0.9))
+        except (TypeError, ValueError):
+            top_p = 0.9
+        try:
+            num_ctx = int(self.app_config.get("num_ctx", 16384))
+        except (TypeError, ValueError):
+            num_ctx = 16384
+
+        payload = json.dumps({
+            "model": model,
+            "messages": [{"role": "user", "content": prompt}],
+            "stream": True,
+            "options": {
+                "temperature": temperature,
+                "top_p": top_p,
+                "repeat_penalty": 1.05,
+                "num_ctx": num_ctx,
+            },
+        }).encode("utf-8")
+        req = urllib.request.Request(
+            self.OLLAMA_CHAT_URL, data=payload,
+            headers={"Content-Type": "application/json"},
+        )
+
+        accumulated = []
+        with urllib.request.urlopen(req, timeout=600) as response:
+            for raw_line in response:
+                if not raw_line.strip():
+                    continue
+                try:
+                    chunk = json.loads(raw_line.decode("utf-8"))
+                except json.JSONDecodeError:
+                    continue
+                if "message" in chunk:
+                    content = chunk["message"].get("content", "")
+                    if content:
+                        accumulated.append(content)
+                        if on_chunk is not None:
+                            try:
+                                on_chunk(content)
+                            except Exception:
+                                pass
+                if chunk.get("done", False):
+                    break
+        return "".join(accumulated)
+
+    # ─── NEW: chat → batch bridge ────────────────────────────────────────
+    def _add_batch_tasks(self, tasks):
+        """Called from ChatPanel.render_batch_suggestions when the user
+        clicks 'Send to Batch Tab'."""
+        if not hasattr(self, "batch_tab"):
+            return
+        try:
+            self.batch_tab.add_tasks(tasks)
+            try:
+                self.notebook.select(self.batch_tab)
+            except Exception:
+                pass
+            self.flash_status(
+                f"Status: Added {len(tasks)} task(s) to Batch tab", "green")
+        except Exception as e:
+            self.flash_status(f"Error: {e}", "red")
 
     # --- Status delegation ------------------------------------------------
     def flash_status(self, message, color="green", duration=2500):
@@ -141,8 +297,7 @@ class LocalAIApp:
                         if line and not line.startswith("#") and "=" in line:
                             k, v = line.split("=", 1)
                             self.personalities[k.strip()] = v.strip()
-            
-            # If the file exists but is empty, or doesn't exist, use fallback
+
             if not self.personalities:
                 self.personalities = fallback
         except Exception as e:
@@ -295,16 +450,23 @@ class LocalAIApp:
             self._cancel_stream()
         return None
 
+    # ─── CHANGED: use widget identity instead of numeric index ────────────
     def _on_tab_changed(self, event=None):
         try:
-            idx = self.notebook.index(self.notebook.select())
-            if idx == 1:
+            widget = self.notebook.nametowidget(self.notebook.select())
+            if widget is self.calendar_tab:
                 self.calendar_tab.refresh()
-            elif idx == 2:
+            elif widget is self.tasks_tab:
                 self.tasks_tab.refresh()
+            elif widget is self.dashboard_tab:
+                try:
+                    self.dashboard_tab._load_data()
+                except Exception:
+                    pass
         except Exception:
             pass
 
+    # ─── CHANGED: stop the batch runner too on close ─────────────────────
     def _on_close(self):
         try:
             self.app_config["window_geometry"] = self.root.winfo_geometry()
@@ -316,12 +478,17 @@ class LocalAIApp:
         except Exception:
             pass
         try:
+            if hasattr(self, "batch_tab"):
+                self.batch_tab.stop_if_running()
+        except Exception:
+            pass
+        try:
             self._stream_cancel.set()
         except Exception:
             pass
         self.root.after(150, self.root.destroy)
 
-    # --- Settings / notifier ----------------------------------------------
+    # --- Settings / notifier ---------------------------------------------
     def _open_settings_dialog(self):
         dlg = tk.Toplevel(self.root)
         dlg.title("Settings")
@@ -644,7 +811,6 @@ class LocalAIApp:
             return
         self.chat_panel._reset_input_field()
         self._send_message(q)
-
 
     def _send_message(self, query, display_text=None, sender="You"):
         if self.is_streaming:
