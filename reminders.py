@@ -6,7 +6,7 @@ import urllib.request
 from datetime import datetime, timedelta
 
 from .db import (
-    NOTIFIER_CONFIG, NTFY_URL, _db,
+    NOTIFIER_CONFIG, NTFY_URL, _db, _add_month, _advance_recurrence,
 )
 
 
@@ -68,24 +68,6 @@ def _send_ntfy(topic, title, message, priority="default", tags="calendar"):
         return False
 
 
-def _add_month(dt):
-    """Advance dt by one calendar month, clamping day to the last day of month."""
-    import calendar as _cal
-    y, m = (dt.year + 1, 1) if dt.month == 12 else (dt.year, dt.month + 1)
-    day = min(dt.day, _cal.monthrange(y, m)[1])
-    return dt.replace(year=y, month=m, day=day)
-
-
-def _advance_recurrence(start, end, rec):
-    if rec == "daily":
-        return start + timedelta(days=1), end + timedelta(days=1)
-    if rec == "weekly":
-        return start + timedelta(weeks=1), end + timedelta(weeks=1)
-    if rec == "monthly":
-        return _add_month(start), _add_month(end)
-    return None
-
-
 class ReminderService:
     def __init__(self, app):
         self.app = app
@@ -134,14 +116,27 @@ class ReminderService:
 
     def stop(self): self._stop.set()
 
-    def reset_notified(self):
+    def reset_notified(self, persist=True):
+        """Forget which reminders were sent. With persist=False only memory and the
+        in-memory config are updated; the caller is expected to save the config
+        itself (e.g. debounced), so we don't hit the disk on every keystroke."""
         had = False
         with self._lock:
             had = bool(self._notified)
             self._notified.clear()
         if had:
             self.app.notifier_config["notified_keys"] = []
-            _save_notifier_config(self.app.notifier_config)
+            if persist:
+                _save_notifier_config(self.app.notifier_config)
+
+    def clear_notified_for(self, kind, item_id):
+        """Forget sent reminders for one event/task (it was rescheduled or recurred)."""
+        with self._lock:
+            keep = {k for k in self._notified if not (k[0] == kind and k[1] == item_id)}
+            changed = keep != self._notified
+            self._notified = keep
+        if changed:
+            self._persist_notified()
 
     def _post_to_ui(self, fn):
         """Hand a callback to the Tk main loop, preferring an app-provided queue."""
@@ -161,6 +156,7 @@ class ReminderService:
     def _advance_recurring_events(self):
         now_dt = datetime.now()
         now_str = now_dt.strftime("%Y-%m-%dT%H:%M")
+        advanced_ids = []
         with _db() as conn:
             rows = conn.execute(
                 "SELECT id, start_ts, end_ts, recurrence FROM events "
@@ -187,8 +183,12 @@ class ReminderService:
                     conn.execute("UPDATE events SET start_ts=?, end_ts=? WHERE id=?",
                                  (start.strftime("%Y-%m-%dT%H:%M"),
                                   end.strftime("%Y-%m-%dT%H:%M"), r["id"]))
+                    advanced_ids.append(r["id"])
                 except Exception:
                     pass
+        # The occurrence moved: reminders sent for the old one must not suppress the next.
+        for eid in advanced_ids:
+            self.clear_notified_for("event", eid)
 
     def _loop(self):
         while not self._stop.is_set():

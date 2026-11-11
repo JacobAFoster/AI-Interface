@@ -238,6 +238,7 @@ class ChatPanel(ttk.Frame):
         if self._current_ai_start_index:
             self.chat_display.delete(self._current_ai_start_index, tk.END)
             self.chat_display.config(state=tk.DISABLED)
+            self._current_ai_start_index = None
             self._insert_markdown(full_response, sender=None)
         else: self.chat_display.config(state=tk.DISABLED)
         self._check_scroll_btn()
@@ -365,6 +366,7 @@ class ChatPanel(ttk.Frame):
         self.chat_display.config(state=tk.NORMAL)
         self.chat_display.delete("1.0", tk.END)
         self.chat_display.config(state=tk.DISABLED)
+        self._current_ai_start_index = None
 
     def _clear_terminal_display(self):
         self.clear_terminal()

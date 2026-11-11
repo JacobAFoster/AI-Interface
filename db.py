@@ -5,7 +5,7 @@ import json
 import sqlite3
 import shutil
 from contextlib import contextmanager, closing
-from datetime import datetime
+from datetime import datetime, timedelta
 
 NO_PERSONA = "(None — default assistant)"
 MAX_MESSAGES_PER_CONVERSATION = 200
@@ -141,10 +141,24 @@ def _load_app_config():
         if os.path.exists(APP_CONFIG):
             with open(APP_CONFIG, "r", encoding="utf-8") as f:
                 loaded = json.load(f)
-            for k in cfg:
-                if k in loaded: cfg[k] = loaded[k]
+            if isinstance(loaded, dict):
+                # Keep unknown keys too (window_geometry, recent_batch_files,
+                # theme_colors, ...), otherwise they are saved but never restored.
+                cfg.update(loaded)
     except Exception as e: print(f"App config load error: {e}")
     return cfg
+
+
+def _app_config_has_key(key):
+    """True if `key` was explicitly saved in app_config.json (defaults don't count)."""
+    try:
+        if os.path.exists(APP_CONFIG):
+            with open(APP_CONFIG, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            return isinstance(data, dict) and key in data
+    except Exception:
+        pass
+    return False
 
 def _save_app_config(cfg):
     try:
@@ -238,8 +252,51 @@ def _get_tasks(include_done=False):
         else: rows = conn.execute(f"SELECT * FROM tasks WHERE done = 0 ORDER BY {order}").fetchall()
     return [dict(r) for r in rows]
 
+def _add_month(dt):
+    """Advance dt by one calendar month, clamping day to the last day of month."""
+    import calendar as _cal
+    y, m = (dt.year + 1, 1) if dt.month == 12 else (dt.year, dt.month + 1)
+    day = min(dt.day, _cal.monthrange(y, m)[1])
+    return dt.replace(year=y, month=m, day=day)
+
+
+def _advance_recurrence(start, end, rec):
+    if rec == "daily":
+        return start + timedelta(days=1), end + timedelta(days=1)
+    if rec == "weekly":
+        return start + timedelta(weeks=1), end + timedelta(weeks=1)
+    if rec == "monthly":
+        return _add_month(start), _add_month(end)
+    return None
+
+
 def _toggle_task(task_id):
-    with _db() as conn: conn.execute("UPDATE tasks SET done = 1 - done WHERE id = ?", (task_id,))
+    """Toggle done. Completing a recurring task with a due date rolls it forward
+    to its next future occurrence (and leaves it open) instead of closing it.
+    Returns True if the task was rolled forward."""
+    with _db() as conn:
+        row = conn.execute("SELECT done, due_ts, recurrence FROM tasks WHERE id = ?", (task_id,)).fetchone()
+        if row is None:
+            return False
+        rec = (row["recurrence"] or "")
+        if not row["done"] and rec in ("daily", "weekly", "monthly") and row["due_ts"]:
+            try:
+                due = datetime.strptime(row["due_ts"], "%Y-%m-%dT%H:%M")
+                now = datetime.now()
+                for _ in range(1000):
+                    nxt = _advance_recurrence(due, due, rec)
+                    if nxt is None:
+                        break
+                    due = nxt[0]
+                    if due > now:
+                        break
+                conn.execute("UPDATE tasks SET due_ts = ? WHERE id = ?",
+                             (due.strftime("%Y-%m-%dT%H:%M"), task_id))
+                return True
+            except ValueError:
+                pass
+        conn.execute("UPDATE tasks SET done = 1 - done WHERE id = ?", (task_id,))
+        return False
 
 def _update_task(task_id, title, description, due_ts, priority, reminder_minutes=DEFAULT_REMINDER_MINUTES, recurrence=''):
     if priority not in ('low', 'normal', 'high'): priority = 'normal'

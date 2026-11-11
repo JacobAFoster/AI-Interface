@@ -39,7 +39,15 @@ def _parse_ts_relaxed(s):
 
     now = datetime.now()
     base = None
-    if "today" in low:
+    iso = re.search(r'\b(\d{4})-(\d{2})-(\d{2})\b', low)
+    if iso:
+        try:
+            base = datetime(int(iso.group(1)), int(iso.group(2)), int(iso.group(3)))
+        except ValueError:
+            base = None
+    if base is not None:
+        pass
+    elif "today" in low:
         base = now
     elif "tomorrow" in low:
         base = now + timedelta(days=1)
@@ -257,18 +265,34 @@ def _log_parse_failure(text):
         pass
 
 
-def _parse_reminder_minutes(raw):
+VALID_RECURRENCE = ("daily", "weekly", "monthly")
+
+
+def _parse_recurrence(raw):
+    """Normalise a model/user supplied recurrence value to '' or daily/weekly/monthly."""
+    if raw is None:
+        return ""
+    r = str(raw).strip().lower()
+    return r if r in VALID_RECURRENCE else ""
+
+
+def _parse_reminder_minutes(raw, default=None):
+    if default is None:
+        default = DEFAULT_REMINDER_MINUTES
     try:
-        rm_int = int(raw) if raw is not None else DEFAULT_REMINDER_MINUTES
+        rm_int = int(raw) if raw is not None else int(default)
     except (TypeError, ValueError):
-        rm_int = DEFAULT_REMINDER_MINUTES
+        try:
+            rm_int = int(default)
+        except (TypeError, ValueError):
+            rm_int = DEFAULT_REMINDER_MINUTES
     if rm_int < 0:
         rm_int = 0
     return rm_int
 
 
 # --- Event / task JSON parsing -------------------------------------------
-def _try_parse_event_json(s):
+def _try_parse_event_json(s, default_reminder=None):
     if not s or not s.strip():
         return None
     s = _strip_json_comments(_normalize_json_text(s.strip()))
@@ -316,11 +340,12 @@ def _try_parse_event_json(s):
         "start_ts": s_norm,
         "end_ts": e_norm,
         "description": str(desc).strip(),
-        "reminder_minutes": _parse_reminder_minutes(rm_raw),
+        "recurrence": _parse_recurrence(pick("recurrence", "repeat", "recurring")),
+        "reminder_minutes": _parse_reminder_minutes(rm_raw, default_reminder),
     }
 
 
-def _try_parse_task_json(s):
+def _try_parse_task_json(s, default_reminder=None):
     if not s or not s.strip():
         return None
     s = _strip_json_comments(_normalize_json_text(s.strip()))
@@ -363,16 +388,17 @@ def _try_parse_task_json(s):
         "description": str(desc).strip(),
         "due_ts": due_norm,
         "priority": prio,
-        "reminder_minutes": _parse_reminder_minutes(rm_raw),
+        "recurrence": _parse_recurrence(pick("recurrence", "repeat", "recurring")),
+        "reminder_minutes": _parse_reminder_minutes(rm_raw, default_reminder),
     }
 
 
-def _extract_calendar_events(text):
+def _extract_calendar_events(text, default_reminder=None):
     events, seen = [], set()
     text = _normalize_json_text(text)
 
     def _try(candidate):
-        ev = _try_parse_event_json(candidate)
+        ev = _try_parse_event_json(candidate, default_reminder)
         if ev is None:
             return
         key = (ev["title"], ev["start_ts"], ev["end_ts"])
@@ -408,12 +434,12 @@ def _extract_calendar_events(text):
     return events
 
 
-def _extract_task_blocks(text):
+def _extract_task_blocks(text, default_reminder=None):
     tasks, seen = [], set()
     text = _normalize_json_text(text)
 
     def _try(candidate):
-        t = _try_parse_task_json(candidate)
+        t = _try_parse_task_json(candidate, default_reminder)
         if t is None:
             return
         key = (t["title"], t.get("due_ts") or "")

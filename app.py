@@ -12,7 +12,7 @@ from tkinter import ttk, messagebox, simpledialog, filedialog
 
 from core.db import (
     _migrate_cwd_files, _init_db, _save_app_config, _db,
-    _load_app_config,
+    _load_app_config, _app_config_has_key,
     _get_conversations, _get_messages, _create_conversation,
     _add_message, _delete_message, _delete_conversation, _rename_conversation,
     _trim_orphans_in_db,
@@ -22,7 +22,7 @@ from core.db import (
 )
 from core.parsing import (
     _parse_ts_relaxed,
-    _extract_calendar_events, _extract_task_blocks,
+    _extract_calendar_events, _extract_task_blocks, _extract_batch_tasks,
 )
 from core.context import _calendar_context, _code_output_rules
 from core.reminders import (
@@ -192,50 +192,64 @@ class LocalAIApp:
         finally:
             self.root.after(100, self._drain_ui_queue)
 
+    def _ollama_url(self):
+        url = str(self.app_config.get("ollama_url") or "").strip()
+        return url or self.OLLAMA_CHAT_URL
+
+    def _ollama_options(self):
+        """Build Ollama options from app_config, falling back to safe defaults."""
+        def _f(key, default):
+            try: return float(self.app_config.get(key, default))
+            except (TypeError, ValueError): return default
+        def _i(key, default):
+            try: return int(self.app_config.get(key, default))
+            except (TypeError, ValueError): return default
+        opts = {
+            "temperature": _f("temperature", 0.2),
+            "top_p": _f("top_p", 0.9),
+            "repeat_penalty": _f("repeat_penalty", 1.05),
+            "num_ctx": _i("num_ctx", 16384),
+            "top_k": _i("top_k", 40),
+            "num_predict": _i("num_predict", -1),
+        }
+        seed = _i("seed", 0)
+        if seed:  # 0 means "unset"; passing it would make every reply deterministic
+            opts["seed"] = seed
+        return opts
+
     # ─── NEW: one-shot blocking completion for the Batch tab ─────────────
-    def stream_completion(self, prompt, on_chunk=None, model=None):
+    def stream_completion(self, prompt, on_chunk=None, model=None, timeout=None):
         """Blocking single-turn completion against Ollama.
 
         Used by BatchTab._llm_call. Runs on a background thread there, so
         the `on_chunk` callback must be thread-safe (BatchTab's emitter
         just puts onto `self.ui_queue`).
+
+        `timeout` (seconds) is a hard overall deadline; default is the long
+        generation timeout (600 s).
         """
         model = model or self.current_model.get()
         if not model:
             raise ValueError("No model selected for batch completion")
 
-        try:
-            temperature = float(self.app_config.get("temperature", 0.2))
-        except (TypeError, ValueError):
-            temperature = 0.2
-        try:
-            top_p = float(self.app_config.get("top_p", 0.9))
-        except (TypeError, ValueError):
-            top_p = 0.9
-        try:
-            num_ctx = int(self.app_config.get("num_ctx", 16384))
-        except (TypeError, ValueError):
-            num_ctx = 16384
-
         payload = json.dumps({
             "model": model,
             "messages": [{"role": "user", "content": prompt}],
             "stream": True,
-            "options": {
-                "temperature": temperature,
-                "top_p": top_p,
-                "repeat_penalty": 1.05,
-                "num_ctx": num_ctx,
-            },
+            "options": self._ollama_options(),
         }).encode("utf-8")
         req = urllib.request.Request(
-            self.OLLAMA_CHAT_URL, data=payload,
+            self._ollama_url(), data=payload,
             headers={"Content-Type": "application/json"},
         )
+        deadline = (time.monotonic() + timeout) if timeout else None
+        sock_timeout = min(timeout, 600) if timeout else 600
 
         accumulated = []
-        with urllib.request.urlopen(req, timeout=600) as response:
+        with urllib.request.urlopen(req, timeout=sock_timeout) as response:
             for raw_line in response:
+                if deadline is not None and time.monotonic() > deadline:
+                    raise TimeoutError(f"LLM call exceeded {timeout}s")
                 if not raw_line.strip():
                     continue
                 try:
@@ -307,9 +321,11 @@ class LocalAIApp:
     def reload_personalities(self):
         self.personalities = {}
         self.load_personalities_file()
-        self.sidebar.refresh_personas()
+        # Update the config BEFORE the sidebar re-reads it, so the listbox,
+        # current_persona and the saved config all agree.
         self.app_config["persona"] = NO_PERSONA
         _save_app_config(self.app_config)
+        self.sidebar.refresh_personas()
         self.flash_status("Status: Personalities reloaded", "green")
 
     # --- Conversations ----------------------------------------------------
@@ -353,6 +369,9 @@ class LocalAIApp:
         self._delete_conversation_by_id(self.current_conversation_id)
 
     def _delete_conversation_by_id(self, cid):
+        if self.is_streaming and cid == self.current_conversation_id:
+            self.flash_status("Status: Wait for current response to finish", "orange")
+            return
         if not messagebox.askyesno(
                 "Delete Conversation",
                 "Delete this conversation? This cannot be undone."):
@@ -524,6 +543,12 @@ class LocalAIApp:
         ttk.Entry(row4, textvariable=top_p_var, width=14).pack(side=tk.LEFT)
         ttk.Label(row4, text="  (0.0 – 1.0)", foreground="gray").pack(side=tk.LEFT)
 
+        row5 = ttk.Frame(dlg); row5.pack(fill="x", **pad)
+        ttk.Label(row5, text="Default reminder:", width=18).pack(side=tk.LEFT)
+        def_rm_var = tk.StringVar(value=str(self._default_reminder()))
+        ttk.Entry(row5, textvariable=def_rm_var, width=14).pack(side=tk.LEFT)
+        ttk.Label(row5, text="  (minutes before; 0 = off)", foreground="gray").pack(side=tk.LEFT)
+
         def _save():
             try:
                 nc = int(num_ctx_var.get().strip())
@@ -538,6 +563,9 @@ class LocalAIApp:
                 tpv = float(top_p_var.get().strip())
                 if tpv < 0.0 or tpv > 1.0:
                     raise ValueError("top_p must be 0.0 – 1.0")
+                drm = int(def_rm_var.get().strip())
+                if drm < 0 or drm > 10080:
+                    raise ValueError("Default reminder must be 0 – 10080 minutes")
             except ValueError as e:
                 messagebox.showerror("Settings", str(e), parent=dlg)
                 return
@@ -545,6 +573,7 @@ class LocalAIApp:
             self.app_config["max_history_messages"] = mh
             self.app_config["temperature"] = tp
             self.app_config["top_p"] = tpv
+            self.app_config["default_reminder_minutes"] = drm
             _save_app_config(self.app_config)
             self._update_ctx_label()
             self.flash_status("Status: Settings saved", "green")
@@ -569,7 +598,9 @@ class LocalAIApp:
         self.chat_panel.append_to_terminal("System Prompt Preview", body)
 
     def _on_notifier_config_changed(self):
-        self.notifier_config["ntfy_topic"] = self.sidebar.ntfy_topic_var.get().strip()
+        new_topic = self.sidebar.ntfy_topic_var.get().strip()
+        topic_changed = new_topic != self.notifier_config.get("ntfy_topic", "")
+        self.notifier_config["ntfy_topic"] = new_topic
         self.notifier_config["enabled"] = bool(self.sidebar.reminder_enabled_var.get())
 
         lead_str = self.sidebar.lead_minutes_var.get().strip()
@@ -586,7 +617,13 @@ class LocalAIApp:
         if parsed:
             self.notifier_config["lead_minutes"] = sorted(set(parsed))
 
-        self.reminder_service.reset_notified()
+        # Only a different topic means a different audience; toggling "enabled" or
+        # editing lead times must not make already-sent reminders fire again.
+        # persist=False: the debounced save below writes the file once.
+        if topic_changed:
+            svc = getattr(self, "reminder_service", None)
+            if svc is not None:
+                svc.reset_notified(persist=False)
 
         if self._notifier_save_id is not None:
             try:
@@ -638,7 +675,7 @@ class LocalAIApp:
         self.chat_panel.set_send_enabled(False)
 
     def load_and_sync_models(self):
-        if "allow_auto_pull" not in self.app_config:
+        if not _app_config_has_key("allow_auto_pull"):
             allow = messagebox.askyesno(
                 "Auto-download Ollama models",
                 "This app can download missing Ollama models automatically.\n\n"
@@ -754,41 +791,30 @@ class LocalAIApp:
         if self.current_conversation_id is None:
             return
 
-        if self.conversation_history[-1]["role"] == "assistant":
-            last_user = ""
-            for m in reversed(self.conversation_history):
-                if m["role"] == "user":
-                    last_user = m["content"]
-                    break
-            if not last_user:
-                return
-
-            with _db() as conn:
-                rows = conn.execute(
-                    "SELECT id FROM messages WHERE conversation_id = ? ORDER BY id DESC LIMIT 2",
-                    (self.current_conversation_id,)
-                ).fetchall()
-                for r in rows:
-                    conn.execute("DELETE FROM messages WHERE id = ?", (r["id"],))
-
-            while self.conversation_history:
-                if self.conversation_history[-1]["role"] == "user":
-                    self.conversation_history.pop()
-                    break
-                self.conversation_history.pop()
-
-        elif self.conversation_history[-1]["role"] == "user":
-            last_user = self.conversation_history[-1]["content"]
-            with _db() as conn:
-                rows = conn.execute(
-                    "SELECT id FROM messages WHERE conversation_id = ? ORDER BY id DESC LIMIT 1",
-                    (self.current_conversation_id,)
-                ).fetchall()
-                for r in rows:
-                    conn.execute("DELETE FROM messages WHERE id = ?", (r["id"],))
-            self.conversation_history.pop()
-        else:
+        # Trim by role, not by count: confirmation notes ("[System note: ...]") are
+        # stored as assistant messages and may follow the reply being regenerated.
+        last_user_idx = None
+        for i in range(len(self.conversation_history) - 1, -1, -1):
+            if self.conversation_history[i]["role"] == "user":
+                last_user_idx = i
+                break
+        if last_user_idx is None:
             return
+        last_user = self.conversation_history[last_user_idx]["content"]
+        if not last_user:
+            return
+
+        with _db() as conn:
+            row = conn.execute(
+                "SELECT MAX(id) FROM messages WHERE conversation_id = ? AND role = 'user'",
+                (self.current_conversation_id,)).fetchone()
+            last_user_id = row[0] if row else None
+            if last_user_id is not None:
+                # remove that user message and everything after it; _send_message re-adds the user
+                conn.execute(
+                    "DELETE FROM messages WHERE conversation_id = ? AND id >= ?",
+                    (self.current_conversation_id, last_user_id))
+        del self.conversation_history[last_user_idx:]
 
         self.chat_panel.clear_terminal()
         for m in self.conversation_history:
@@ -837,6 +863,7 @@ class LocalAIApp:
 
         self.chat_panel.append_to_terminal(
             sender, display_text if display_text is not None else query)
+        self.chat_panel._current_ai_start_index = None
         self.chat_panel.start_timer()
 
         system_prompt = "" if persona_key == NO_PERSONA else self.personalities.get(persona_key, "")
@@ -885,32 +912,15 @@ class LocalAIApp:
             print(f"Rollback user message error: {e}")
 
     def _run_chat_stream(self, model, messages, persona_key, user_message, user_msg_id):
-        try:
-            temperature = float(self.app_config.get("temperature", 0.2))
-        except (TypeError, ValueError):
-            temperature = 0.2
-        try:
-            top_p = float(self.app_config.get("top_p", 0.9))
-        except (TypeError, ValueError):
-            top_p = 0.9
-        try:
-            num_ctx = int(self.app_config.get("num_ctx", 4096))
-        except (TypeError, ValueError):
-            num_ctx = 4096
         max_hist = self._max_history()
 
         payload = json.dumps({
             "model": model,
             "messages": messages,
             "stream": True,
-            "options": {
-                "temperature": temperature,
-                "top_p": top_p,
-                "repeat_penalty": 1.05,
-                "num_ctx": num_ctx,
-            }
+            "options": self._ollama_options(),
         }).encode("utf-8")
-        req = urllib.request.Request(self.OLLAMA_CHAT_URL, data=payload,
+        req = urllib.request.Request(self._ollama_url(), data=payload,
                                      headers={"Content-Type": "application/json"})
         accumulated = []
         header_shown = False
@@ -1077,27 +1087,39 @@ class LocalAIApp:
         if last.get("role") != "assistant":
             return 0
         content = last.get("content", "")
-        events = _extract_calendar_events(content)
-        tasks = _extract_task_blocks(content)
+        default_rm = self._default_reminder()
+        events = _extract_calendar_events(content, default_rm)
+        tasks = _extract_task_blocks(content, default_rm)
+        batch = _extract_batch_tasks(content)
         if events:
             self.chat_panel.render_calendar_suggestions(events)
         if tasks:
             self.chat_panel.render_task_suggestions(tasks)
-        return len(events) + len(tasks)
+        if batch:
+            self.chat_panel.render_batch_suggestions(batch)
+        return len(events) + len(tasks) + len(batch)
+
+    def _default_reminder(self):
+        try:
+            return max(0, int(self.app_config.get(
+                "default_reminder_minutes", DEFAULT_REMINDER_MINUTES)))
+        except (TypeError, ValueError):
+            return DEFAULT_REMINDER_MINUTES
 
     def _add_suggested_event(self, ev):
         try:
             rm = ev.get("reminder_minutes")
             if rm is None:
-                rm = DEFAULT_REMINDER_MINUTES
+                rm = self._default_reminder()
             with _db() as conn:
                 conn.execute(
                     "INSERT INTO events (title, start_ts, end_ts, description, "
-                    "reminder_minutes) VALUES (?, ?, ?, ?, ?)",
+                    "reminder_minutes, recurrence) VALUES (?, ?, ?, ?, ?, ?)",
                     (ev["title"],
                      _parse_ts_relaxed(ev["start_ts"]) or ev["start_ts"],
                      _parse_ts_relaxed(ev["end_ts"]) or ev["end_ts"],
-                     ev.get("description", ""), int(rm)))
+                     ev.get("description", ""), int(rm),
+                     ev.get("recurrence", "") or ""))
             self.calendar_tab.refresh()
             self.flash_status(f"Status: Added '{ev['title']}' to calendar", "green")
             rm_note = f", 🔔 {int(rm)}m before" if int(rm) > 0 else ", 🔕 off"
@@ -1115,9 +1137,10 @@ class LocalAIApp:
         try:
             rm = t.get("reminder_minutes")
             if rm is None:
-                rm = DEFAULT_REMINDER_MINUTES
+                rm = self._default_reminder()
             _add_task(t["title"], t.get("description", ""),
-                      t.get("due_ts"), t.get("priority", "normal"), int(rm))
+                      t.get("due_ts"), t.get("priority", "normal"), int(rm),
+                      t.get("recurrence", "") or "")
             self.tasks_tab.refresh()
             self.flash_status(f"Status: Added task '{t['title']}'", "green")
             rm_note = f", 🔔 {int(rm)}m before" if int(rm) > 0 else ", 🔕 off"

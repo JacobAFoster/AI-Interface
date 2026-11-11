@@ -6,7 +6,7 @@ from core.db import (
     DEFAULT_REMINDER_MINUTES,
     _get_tasks, _add_task, _update_task, _toggle_task, _delete_task,
 )
-from core.parsing import _parse_ts_strict
+from core.parsing import _parse_ts_strict, _parse_recurrence
 
 
 class TaskTab(ttk.Frame):
@@ -112,6 +112,8 @@ class TaskTab(ttk.Frame):
             info.append(f"priority: {t['priority']}")
         if t.get("due_ts"):
             info.append(f"due: {t['due_ts']}")
+        if t.get("recurrence"):
+            info.append(f"🔁 {t['recurrence']}")
         if info:
             tk.Label(body, text="  ·  ".join(info), bg="#252526",
                      fg=prio_colors.get(t.get("priority", "normal"), "#4ec9b0"),
@@ -139,8 +141,13 @@ class TaskTab(ttk.Frame):
     # --- CRUD -------------------------------------------------------------
     def _toggle(self, task_id):
         try:
-            _toggle_task(task_id)
+            rolled = _toggle_task(task_id)
+            svc = getattr(self.app, "reminder_service", None)
+            if svc is not None:
+                svc.clear_notified_for("task", task_id)
             self.refresh()
+            if rolled:
+                self.app.flash_status("Status: Recurring task moved to next occurrence", "green")
         except Exception as e:
             self.app.flash_status(f"Error: {e}", "red")
 
@@ -194,6 +201,15 @@ class TaskTab(ttk.Frame):
         ttk.Label(row3b, text="  minutes before due (0 = off)",
                   foreground="gray").pack(side=tk.LEFT)
 
+        row3c = ttk.Frame(dlg); row3c.pack(fill="x", **pad)
+        ttk.Label(row3c, text="Repeats:", width=10).pack(side=tk.LEFT)
+        rec_var = tk.StringVar(value=(task.get("recurrence") or "none") if task else "none")
+        ttk.Combobox(row3c, textvariable=rec_var,
+                     values=["none", "daily", "weekly", "monthly"],
+                     state="readonly", width=10).pack(side=tk.LEFT)
+        ttk.Label(row3c, text="  (needs a due date)",
+                  foreground="gray").pack(side=tk.LEFT)
+
         row4 = ttk.Frame(dlg); row4.pack(fill="x", **pad)
         ttk.Label(row4, text="Description:").pack(anchor="w")
         desc_text = tk.Text(dlg, height=3, width=60, wrap=tk.WORD)
@@ -224,10 +240,16 @@ class TaskTab(ttk.Frame):
 
                 d = desc_text.get("1.0", "end-1c").strip()
                 prio = prio_var.get() or "normal"
+                rec = _parse_recurrence(rec_var.get())
+                if rec and not due_norm:
+                    raise ValueError("A repeating task needs a due date")
                 if task:
-                    _update_task(task["id"], t, d, due_norm, prio, rm_int)
+                    _update_task(task["id"], t, d, due_norm, prio, rm_int, rec)
+                    svc = getattr(self.app, "reminder_service", None)
+                    if svc is not None:
+                        svc.clear_notified_for("task", task["id"])
                 else:
-                    _add_task(t, d, due_norm, prio, rm_int)
+                    _add_task(t, d, due_norm, prio, rm_int, rec)
                 dlg.destroy()
                 self.refresh()
                 self.app.flash_status("Status: Task saved", "green")

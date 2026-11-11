@@ -5,7 +5,7 @@ from tkinter import ttk, messagebox
 from datetime import datetime, timedelta
 
 from core.db import _db, DEFAULT_REMINDER_MINUTES
-from core.parsing import _parse_ts_strict
+from core.parsing import _parse_ts_strict, _parse_recurrence
 
 
 class CalendarTab(ttk.Frame):
@@ -270,6 +270,13 @@ class CalendarTab(ttk.Frame):
         ttk.Label(row3b, text="  minutes before start (0 = off)",
                   foreground="gray").pack(side=tk.LEFT)
 
+        row3c = ttk.Frame(dlg); row3c.pack(fill="x", **pad)
+        ttk.Label(row3c, text="Repeats:", width=10).pack(side=tk.LEFT)
+        rec_var = tk.StringVar(value=((event.get("recurrence") or "none") if event else "none"))
+        ttk.Combobox(row3c, textvariable=rec_var,
+                     values=["none", "daily", "weekly", "monthly"],
+                     state="readonly", width=10).pack(side=tk.LEFT)
+
         row4 = ttk.Frame(dlg); row4.pack(fill="x", **pad)
         ttk.Label(row4, text="Description:").pack(anchor="w")
         desc_text = tk.Text(dlg, height=3, width=55, wrap=tk.WORD, bg=self.app.theme["bg_panel"], fg=self.app.theme["fg_main"])
@@ -303,17 +310,22 @@ class CalendarTab(ttk.Frame):
                     raise ValueError("Remind must be between 0 and 10080 minutes")
 
                 d = desc_text.get("1.0", "end-1c").strip()
+                rec = _parse_recurrence(rec_var.get())
                 with _db() as conn:
                     if event:
                         conn.execute(
                             "UPDATE events SET title=?, start_ts=?, end_ts=?, "
-                            "description=?, reminder_minutes=? WHERE id=?",
-                            (t, s, en, d, rm_int, event["id"]))
+                            "description=?, reminder_minutes=?, recurrence=? WHERE id=?",
+                            (t, s, en, d, rm_int, rec, event["id"]))
                     else:
                         conn.execute(
                             "INSERT INTO events (title, start_ts, end_ts, description, "
-                            "reminder_minutes) VALUES (?, ?, ?, ?, ?)",
-                            (t, s, en, d, rm_int))
+                            "reminder_minutes, recurrence) VALUES (?, ?, ?, ?, ?, ?)",
+                            (t, s, en, d, rm_int, rec))
+                if event:
+                    svc = getattr(self.app, "reminder_service", None)
+                    if svc is not None:
+                        svc.clear_notified_for("event", event["id"])
                 dlg.destroy()
                 self.refresh()
                 self.app.flash_status("Status: Event saved", "green")

@@ -79,6 +79,8 @@ class BatchAborted(Exception):
 class BatchRunner:
     """Runs tasks sequentially against a cloned folder. Threaded."""
 
+    REVIEW_TIMEOUT_S = 90  # hard cap for the optional LLM review check
+
     def __init__(self, config: BatchConfig,
                  llm_fn: Callable[[str, Callable[[str], None]], str],
                  on_event: Callable[[EventType, dict], None]):
@@ -780,7 +782,14 @@ class BatchRunner:
             '{"ok": true, "issues": []}'
         )
         try:
-            raw = self._llm(prompt, on_chunk=lambda _c: None)
+            # Optional check: bound it so a stuck review can't freeze the runner
+            # for the full generation timeout.
+            try:
+                raw = self._llm(prompt, on_chunk=lambda _c: None,
+                                timeout=self.REVIEW_TIMEOUT_S)
+            except TypeError:
+                # llm_fn without a timeout parameter
+                raw = self._llm(prompt, on_chunk=lambda _c: None)
         except Exception as e:
             return {"check": "llm_review", "passed": True, "required": False,
                     "detail": f"skipped ({e})"}

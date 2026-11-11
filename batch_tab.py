@@ -412,8 +412,8 @@ class BatchTab(ttk.Frame):
             self.runner.stop()
             self._log("Stop requested.")
 
-    def _llm_call(self, prompt: str, on_chunk):
-        return self.app.stream_completion(prompt, on_chunk)
+    def _llm_call(self, prompt: str, on_chunk, timeout=None):
+        return self.app.stream_completion(prompt, on_chunk, timeout=timeout)
 
     def _emit_event(self, event_type, payload):
         self.app.ui_queue.put(("batch_event", event_type, payload))
